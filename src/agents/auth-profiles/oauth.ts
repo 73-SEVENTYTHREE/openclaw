@@ -12,9 +12,12 @@ import {
   formatProviderAuthProfileApiKeyWithPlugin,
   refreshProviderOAuthCredentialWithPlugin,
 } from "../../plugins/provider-runtime.runtime.js";
+import { getActivePluginGatewayRuntimeRegistry } from "../../plugins/runtime.js";
+import type { ProviderPlugin } from "../../plugins/types.js";
 import { resolveSecretRefString, type SecretRefResolveCache } from "../../secrets/resolve.js";
 import { normalizeLowercaseStringOrEmpty } from "../../shared/string-coerce.js";
 import { refreshChutesTokens } from "../chutes-oauth.js";
+import { normalizeProviderId } from "../provider-id.js";
 import { log } from "./constants.js";
 import { resolveTokenExpiryState } from "./credential-state.js";
 import { formatAuthDoctorHint } from "./doctor.js";
@@ -62,6 +65,8 @@ const isOAuthProvider = (provider: string): provider is OAuthProvider =>
 const resolveOAuthProvider = (provider: string): OAuthProvider | null =>
   isOAuthProvider(provider) ? provider : null;
 
+const BUNDLED_OAUTH_API_KEY_FORMATTER_PROVIDERS = new Set(["google"]);
+
 /** Bearer-token auth modes that are interchangeable (oauth tokens and raw tokens). */
 const BEARER_AUTH_MODES = new Set(["oauth", "token"]);
 
@@ -98,12 +103,48 @@ async function buildOAuthApiKey(
   credentials: OAuthCredential,
   context: { cfg?: OpenClawConfig },
 ): Promise<string> {
+  const loadedFormatter = resolveLoadedOAuthApiKeyFormatter(provider);
+  if (loadedFormatter) {
+    const formatted = loadedFormatter(credentials);
+    if (typeof formatted === "string" && formatted.length > 0) {
+      return formatted;
+    }
+  }
+  if (!BUNDLED_OAUTH_API_KEY_FORMATTER_PROVIDERS.has(normalizeProviderId(provider))) {
+    return credentials.access;
+  }
   const formatted = await formatProviderAuthProfileApiKeyWithPlugin({
     provider,
     config: context.cfg,
     context: credentials,
   });
   return typeof formatted === "string" && formatted.length > 0 ? formatted : credentials.access;
+}
+
+function resolveLoadedOAuthApiKeyFormatter(
+  provider: string,
+): ProviderPlugin["formatApiKey"] | undefined {
+  const normalizedProvider = normalizeProviderId(provider);
+  if (!normalizedProvider) {
+    return undefined;
+  }
+  for (const entry of getActivePluginGatewayRuntimeRegistry()?.providers ?? []) {
+    const plugin = entry.provider;
+    if (!providerPluginMatchesId(plugin, normalizedProvider)) {
+      continue;
+    }
+    return plugin.formatApiKey;
+  }
+  return undefined;
+}
+
+function providerPluginMatchesId(plugin: ProviderPlugin, normalizedProvider: string): boolean {
+  if (normalizeProviderId(plugin.id) === normalizedProvider) {
+    return true;
+  }
+  return [...(plugin.aliases ?? []), ...(plugin.hookAliases ?? [])].some(
+    (alias) => normalizeProviderId(alias) === normalizedProvider,
+  );
 }
 
 function buildApiKeyProfileResult(params: { apiKey: string; provider: string; email?: string }) {
