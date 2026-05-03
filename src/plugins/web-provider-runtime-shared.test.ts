@@ -308,6 +308,34 @@ describe("web-provider-runtime-shared", () => {
     expect(mocks.loadOpenClawPlugins).not.toHaveBeenCalled();
   });
 
+  it("uses bundled runtime web provider public artifacts before full plugin loads", () => {
+    const bundledRuntimeProviders = ["provider"];
+
+    const providers = resolvePluginWebProviders(
+      {
+        config: {},
+        onlyPluginIds: ["brave"],
+      },
+      {
+        resolveBundledResolutionConfig: () => ({
+          config: {},
+          activationSourceConfig: {},
+          autoEnabledReasons: {},
+        }),
+        resolveCandidatePluginIds: () => ["brave"],
+        mapRegistryProviders: vi.fn(() => {
+          throw new Error(
+            "runtime registry should stay unused when bundled public artifacts resolve",
+          );
+        }),
+        resolveBundledRuntimePublicArtifactProviders: () => bundledRuntimeProviders,
+      },
+    );
+
+    expect(providers).toEqual(bundledRuntimeProviders);
+    expect(mocks.loadOpenClawPlugins).not.toHaveBeenCalled();
+  });
+
   it("ignores runtime web provider cache opt-outs after startup loading", () => {
     const loadedRegistry = { source: "loaded" };
     const mapRegistryProviders = vi.fn(() => ["provider"]);

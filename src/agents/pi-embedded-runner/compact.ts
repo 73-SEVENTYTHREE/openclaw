@@ -58,7 +58,6 @@ import {
 } from "../model-catalog-scope.js";
 import { isFallbackSummaryError, runWithModelFallback } from "../model-fallback.js";
 import { supportsModelTools } from "../model-tool-support.js";
-import { ensureOpenClawModelsJson } from "../models-config.js";
 import { resolveOwnerDisplaySetting } from "../owner-display.js";
 import { createBundleLspToolRuntime } from "../pi-bundle-lsp-runtime.js";
 import { createBundleMcpToolRuntime } from "../pi-bundle-mcp-tools.js";
@@ -125,7 +124,7 @@ import { log } from "./logger.js";
 import { hardenManualCompactionBoundary } from "./manual-compaction-boundary.js";
 import { buildEmbeddedMessageActionDiscoveryInput } from "./message-action-discovery-input.js";
 import { readPiModelContextTokens } from "./model-context-tokens.js";
-import { buildModelAliasLines, resolveModelAsync } from "./model.js";
+import { buildModelAliasLines, resolveModelAsyncWithPiDiscoveryFallback } from "./model.js";
 import { sanitizeSessionHistory, validateReplayTurns } from "./replay-history.js";
 import { createEmbeddedPiResourceLoader } from "./resource-loader.js";
 import { shouldUseOpenAIWebSocketTransport } from "./run/attempt.thread-helpers.js";
@@ -481,15 +480,11 @@ async function compactEmbeddedPiSessionDirectOnce(
   });
   const providerDiscoveryProviderIds =
     resolveProviderDiscoveryProviderIdsForCatalogScope(catalogScope);
-  await ensureOpenClawModelsJson(params.config, agentDir, {
-    ...(providerDiscoveryProviderIds ? { providerDiscoveryProviderIds } : {}),
-  });
-  const { model, error, authStorage, modelRegistry } = await resolveModelAsync(
-    provider,
-    modelId,
-    agentDir,
-    params.config,
-  );
+  const { model, error, authStorage, modelRegistry } =
+    await resolveModelAsyncWithPiDiscoveryFallback(provider, modelId, agentDir, params.config, {
+      workspaceDir: resolvedWorkspace,
+      ...(providerDiscoveryProviderIds ? { providerDiscoveryProviderIds } : {}),
+    });
   if (!model) {
     const reason = error ?? `Unknown model: ${provider}/${modelId}`;
     return fail(reason);

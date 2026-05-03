@@ -55,7 +55,6 @@ import {
   resolveModelCatalogScope,
   resolveProviderDiscoveryProviderIdsForCatalogScope,
 } from "../model-catalog-scope.js";
-import { ensureOpenClawModelsJson } from "../models-config.js";
 import {
   retireSessionMcpRuntime,
   retireSessionMcpRuntimeForSessionKey,
@@ -88,7 +87,7 @@ import { hasMessagingToolDeliveryEvidence } from "./delivery-evidence.js";
 import { resolveEmbeddedRunFailureSignal } from "./failure-signal.js";
 import { resolveGlobalLane, resolveSessionLane } from "./lanes.js";
 import { log } from "./logger.js";
-import { resolveModelAsync } from "./model.js";
+import { resolveModelAsyncWithPiDiscoveryFallback } from "./model.js";
 import { createEmbeddedRunReplayState, observeReplayMetadata } from "./replay-state.js";
 import { handleAssistantFailover } from "./run/assistant-failover.js";
 import { EmbeddedRunStageName } from "./run/attempt-stage-timing.js";
@@ -478,34 +477,24 @@ export async function runEmbeddedPiAgent(
       });
       startupStages.mark(EmbeddedRunStageName.harnessPrep);
       const pluginHarnessOwnsTransport = agentHarness.id !== "pi";
-      const dynamicModelResolution = await resolveModelAsync(
+      const catalogScope = resolveModelCatalogScope({
+        cfg: params.config,
+        provider,
+        model: modelId,
+      });
+      const providerDiscoveryProviderIds =
+        resolveProviderDiscoveryProviderIdsForCatalogScope(catalogScope);
+      const modelResolution = await resolveModelAsyncWithPiDiscoveryFallback(
         provider,
         modelId,
         agentDir,
         params.config,
         {
-          // Plugin dynamic model hooks can resolve explicit model refs without
-          // first generating PI models.json. This keeps one-shot model runs from
-          // blocking on unrelated provider discovery.
-          skipPiDiscovery: true,
+          workspaceDir: resolvedWorkspace,
+          allowUnresolvedFastPath: pluginHarnessOwnsTransport,
+          ...(providerDiscoveryProviderIds ? { providerDiscoveryProviderIds } : {}),
         },
       );
-      const modelResolution =
-        dynamicModelResolution.model || pluginHarnessOwnsTransport
-          ? dynamicModelResolution
-          : await (async () => {
-              const catalogScope = resolveModelCatalogScope({
-                cfg: params.config,
-                provider,
-                model: modelId,
-              });
-              const providerDiscoveryProviderIds =
-                resolveProviderDiscoveryProviderIdsForCatalogScope(catalogScope);
-              await ensureOpenClawModelsJson(params.config, agentDir, {
-                ...(providerDiscoveryProviderIds ? { providerDiscoveryProviderIds } : {}),
-              });
-              return await resolveModelAsync(provider, modelId, agentDir, params.config);
-            })();
       const { model, error, authStorage, modelRegistry } = modelResolution;
       if (!model) {
         throw new FailoverError(error ?? `Unknown model: ${provider}/${modelId}`, {

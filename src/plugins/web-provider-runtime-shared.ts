@@ -56,6 +56,13 @@ type ResolveWebProviderRuntimeDeps<TEntry> = {
     bundledAllowlistCompat?: boolean;
     onlyPluginIds?: readonly string[];
   }) => TEntry[] | null;
+  resolveBundledRuntimePublicArtifactProviders?: (params: {
+    config?: PluginLoadOptions["config"];
+    workspaceDir?: string;
+    env?: PluginLoadOptions["env"];
+    bundledAllowlistCompat?: boolean;
+    onlyPluginIds?: readonly string[];
+  }) => TEntry[] | null;
 };
 
 type WebProviderRuntimeContext = {
@@ -203,6 +210,18 @@ export function resolvePluginWebProviders<TEntry>(
   const hasExplicitEmptyScope = scopedPluginIds !== undefined && scopedPluginIds.length === 0;
   if (hasExplicitEmptyScope) {
     return [];
+  }
+  if (params.activate !== true) {
+    const bundledRuntimeArtifactProviders = deps.resolveBundledRuntimePublicArtifactProviders?.({
+      config: context.config,
+      workspaceDir: context.workspaceDir,
+      env: context.env,
+      bundledAllowlistCompat: params.bundledAllowlistCompat,
+      onlyPluginIds: context.loadPluginIds,
+    });
+    if (bundledRuntimeArtifactProviders) {
+      return bundledRuntimeArtifactProviders;
+    }
   }
   const registry = loadOpenClawPlugins(loadOptions);
   return deps.mapRegistryProviders({

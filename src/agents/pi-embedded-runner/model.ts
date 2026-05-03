@@ -27,6 +27,7 @@ import {
   shouldSuppressBuiltInModel,
   shouldUnconditionallySuppress,
 } from "../model-suppression.js";
+import { ensureOpenClawModelsJson } from "../models-config.js";
 import { discoverAuthStorage, discoverModels } from "../pi-model-discovery.js";
 import {
   attachModelProviderRequestTransport,
@@ -124,6 +125,25 @@ type ResolvedModelAsyncResult = {
   modelRegistry: ModelRegistry;
 };
 
+type ResolveModelAsyncOptions = {
+  authStorage?: AuthStorage;
+  modelRegistry?: ModelRegistry;
+  retryTransientProviderRuntimeMiss?: boolean;
+  runtimeHooks?: ProviderRuntimeHooks;
+  skipProviderRuntimeHooks?: boolean;
+  skipPiDiscovery?: boolean;
+};
+
+type ResolveModelAsyncWithPiDiscoveryFallbackOptions = Omit<
+  ResolveModelAsyncOptions,
+  "skipPiDiscovery"
+> & {
+  workspaceDir?: string;
+  providerDiscoveryProviderIds?: readonly string[];
+  providerDiscoveryEntriesOnly?: boolean;
+  allowUnresolvedFastPath?: boolean;
+};
+
 const SKIP_PI_DISCOVERY_MODEL_CACHE_MAX = 128;
 const skipPiDiscoveryModelCache = new Map<string, Promise<ResolvedModelAsyncResult>>();
 
@@ -183,6 +203,12 @@ function rememberSkipPiDiscoveryModelResolution(
       throw error;
     });
 }
+
+export const __testing = {
+  clearSkipPiDiscoveryModelCacheForTest(): void {
+    skipPiDiscoveryModelCache.clear();
+  },
+} as const;
 
 function resolveRuntimeHooks(params?: {
   runtimeHooks?: ProviderRuntimeHooks;
@@ -1090,14 +1116,7 @@ export async function resolveModelAsync(
   modelId: string,
   agentDir?: string,
   cfg?: OpenClawConfig,
-  options?: {
-    authStorage?: AuthStorage;
-    modelRegistry?: ModelRegistry;
-    retryTransientProviderRuntimeMiss?: boolean;
-    runtimeHooks?: ProviderRuntimeHooks;
-    skipProviderRuntimeHooks?: boolean;
-    skipPiDiscovery?: boolean;
-  },
+  options?: ResolveModelAsyncOptions,
 ): Promise<{
   model?: Model<Api>;
   error?: string;
@@ -1158,6 +1177,7 @@ export async function resolveModelAsync(
         modelRegistry,
       };
     }
+
     const providerConfig = resolveConfiguredProviderConfig(cfg, normalizedRef.provider);
     const resolveDynamicAttempt = async () => {
       await runtimeHooks.prepareProviderDynamicModel({
@@ -1218,6 +1238,36 @@ export async function resolveModelAsync(
   return cacheKey
     ? await rememberSkipPiDiscoveryModelResolution(cacheKey, resolved)
     : await resolved;
+}
+
+export async function resolveModelAsyncWithPiDiscoveryFallback(
+  provider: string,
+  modelId: string,
+  agentDir?: string,
+  cfg?: OpenClawConfig,
+  options?: ResolveModelAsyncWithPiDiscoveryFallbackOptions,
+): Promise<ResolvedModelAsyncResult> {
+  const resolvedAgentDir = agentDir ?? resolveOpenClawAgentDir();
+  const {
+    workspaceDir,
+    providerDiscoveryProviderIds,
+    providerDiscoveryEntriesOnly,
+    allowUnresolvedFastPath,
+    ...resolveOptions
+  } = options ?? {};
+  const fastPath = await resolveModelAsync(provider, modelId, resolvedAgentDir, cfg, {
+    ...resolveOptions,
+    skipPiDiscovery: true,
+  });
+  if (fastPath.model || allowUnresolvedFastPath) {
+    return fastPath;
+  }
+  await ensureOpenClawModelsJson(cfg, resolvedAgentDir, {
+    ...(workspaceDir ? { workspaceDir } : {}),
+    ...(providerDiscoveryProviderIds ? { providerDiscoveryProviderIds } : {}),
+    ...(providerDiscoveryEntriesOnly === true ? { providerDiscoveryEntriesOnly: true } : {}),
+  });
+  return await resolveModelAsync(provider, modelId, resolvedAgentDir, cfg, resolveOptions);
 }
 
 /**
