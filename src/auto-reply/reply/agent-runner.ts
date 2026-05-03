@@ -2,7 +2,6 @@ import fs from "node:fs/promises";
 import { hasConfiguredModelFallbacks, resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { resolveContextTokensForModel } from "../../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../../agents/defaults.js";
-import { resolveModelAuthMode } from "../../agents/model-auth.js";
 import { isCliProvider } from "../../agents/model-selection.js";
 import { queueEmbeddedPiMessage } from "../../agents/pi-embedded-runner/runs.js";
 import { deriveContextPromptTokens, hasNonzeroUsage, normalizeUsage } from "../../agents/usage.js";
@@ -80,9 +79,10 @@ import {
   replyRunRegistry,
   type ReplyOperation,
 } from "./reply-run-registry.js";
+import { createReplyStageTracker, ReplyStageName } from "./reply-stage-timing.js";
 import { createReplyToModeFilterForChannel, resolveReplyToMode } from "./reply-threading.js";
 import { incrementRunCompactionCount, persistRunSessionUsage } from "./session-run-accounting.js";
-import { createTypingSignaler } from "./typing-mode.js";
+import { createTypingSignaler, type TypingSignaler } from "./typing-mode.js";
 import type { TypingController } from "./typing.js";
 
 const BLOCK_REPLY_SEND_TIMEOUT_MS = 15_000;
@@ -918,6 +918,7 @@ export async function runReplyAgent(params: {
   sessionCtx: TemplateContext;
   shouldInjectGroupIntro: boolean;
   typingMode: TypingMode;
+  typingSignals?: TypingSignaler;
   resetTriggered?: boolean;
   replyThreadingOverride?: TemplateContext["ReplyThreading"];
   replyOperation?: ReplyOperation;
@@ -950,6 +951,7 @@ export async function runReplyAgent(params: {
     sessionCtx,
     shouldInjectGroupIntro,
     typingMode,
+    typingSignals: providedTypingSignals,
     resetTriggered,
     replyThreadingOverride,
     replyOperation: providedReplyOperation,
@@ -964,11 +966,13 @@ export async function runReplyAgent(params: {
   const effectiveShouldFollowup = !effectiveResetTriggered && shouldFollowup;
 
   const isHeartbeat = opts?.isHeartbeat === true;
-  const typingSignals = createTypingSignaler({
-    typing,
-    mode: typingMode,
-    isHeartbeat,
-  });
+  const typingSignals =
+    providedTypingSignals ??
+    createTypingSignaler({
+      typing,
+      mode: typingMode,
+      isHeartbeat,
+    });
 
   const shouldEmitToolResult = createShouldEmitToolResult({
     sessionKey,
@@ -1138,9 +1142,11 @@ export async function runReplyAgent(params: {
   let runFollowupTurn = queuedRunFollowupTurn;
   const prePreflightCompactionCount = activeSessionEntry?.compactionCount ?? 0;
   let preflightCompactionApplied = false;
+  const replyStageTracker = createReplyStageTracker();
 
   try {
     await typingSignals.signalRunStart();
+    replyStageTracker.mark(ReplyStageName.typingRunStart);
 
     activeSessionEntry = await runPreflightCompactionIfNeeded({
       cfg,
@@ -1156,6 +1162,7 @@ export async function runReplyAgent(params: {
       isHeartbeat,
       replyOperation,
     });
+    replyStageTracker.mark(ReplyStageName.preflightCompaction);
     preflightCompactionApplied =
       (activeSessionEntry?.compactionCount ?? 0) > prePreflightCompactionCount;
 
@@ -1176,6 +1183,7 @@ export async function runReplyAgent(params: {
       isHeartbeat,
       replyOperation,
     });
+    replyStageTracker.mark(ReplyStageName.memoryFlush);
 
     runFollowupTurn = createFollowupRunner({
       opts,
@@ -1188,6 +1196,7 @@ export async function runReplyAgent(params: {
       defaultModel,
       agentCfgContextTokens,
     });
+    replyStageTracker.mark(ReplyStageName.followupRunner);
 
     let responseUsageLine: string | undefined;
     type SessionResetOptions = {
@@ -1236,6 +1245,7 @@ export async function runReplyAgent(params: {
       });
 
     replyOperation.setPhase("running");
+    replyStageTracker.mark(ReplyStageName.replyOperationStart);
     const runStartedAt = Date.now();
     const runOutcome = await runAgentTurnWithFallback({
       commandBody,
@@ -1264,6 +1274,7 @@ export async function runReplyAgent(params: {
       storePath,
       resolvedVerboseLevel,
       replyMediaContext,
+      replyStageTracker,
     });
 
     if (runOutcome.kind === "final") {
@@ -1528,11 +1539,9 @@ export async function runReplyAgent(params: {
       activeSessionEntry?.responseUsage ??
       (sessionKey ? activeSessionStore?.[sessionKey]?.responseUsage : undefined);
     const responseUsageMode = resolveResponseUsageMode(responseUsageRaw);
+    const runAuthMode = normalizeOptionalString(runResult.meta?.requestShaping?.authMode);
     if (responseUsageMode !== "off" && hasNonzeroUsage(usage)) {
-      const authMode = resolveModelAuthMode(providerUsed, cfg, undefined, {
-        workspaceDir: followupRun.run.workspaceDir,
-      });
-      const showCost = authMode === "api-key";
+      const showCost = runAuthMode === "api-key";
       const costConfig = showCost
         ? resolveModelCostConfig({
             provider: providerUsed,
@@ -1691,13 +1700,7 @@ export async function runReplyAgent(params: {
       runner: isCliProvider(providerUsed, cfg) ? "cli" : "embedded",
     });
     const requestShaping = {
-      authMode:
-        runResult.meta?.requestShaping?.authMode ??
-        (cfg?.models?.providers && providerUsed in cfg.models.providers
-          ? (resolveModelAuthMode(providerUsed, cfg, undefined, {
-              workspaceDir: followupRun.run.workspaceDir,
-            }) ?? undefined)
-          : undefined),
+      authMode: runAuthMode,
       thinking:
         runResult.meta?.requestShaping?.thinking ??
         normalizeOptionalString(followupRun.run.thinkLevel),
