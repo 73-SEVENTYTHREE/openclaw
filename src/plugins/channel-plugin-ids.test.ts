@@ -609,12 +609,12 @@ describe("resolveGatewayStartupPluginIds", () => {
 
   it.each([
     [
-      "includes only configured channel plugins at idle startup",
+      "includes configured agent model provider owners at startup",
       createStartupConfig({
         enabledPluginIds: ["voice-call"],
         modelId: "demo-cli/demo-model",
       }),
-      ["demo-channel", "browser", "voice-call", "memory-core"],
+      ["demo-channel", "browser", "demo-provider-plugin", "voice-call", "memory-core"],
     ],
     [
       "keeps bundled startup sidecars with enabledByDefault at idle startup",
@@ -1288,12 +1288,12 @@ describe("resolveGatewayStartupPluginIds", () => {
     });
   });
 
-  it("does not include non-selected memory plugins only because they are enabled", () => {
+  it("includes explicitly enabled memory plugins even when they are not selected via the slot", () => {
     expectStartupPluginIdsCase({
       config: createStartupConfig({
         enabledPluginIds: ["memory-lancedb"],
       }),
-      expected: ["demo-channel", "browser", "memory-core"],
+      expected: ["demo-channel", "browser", "memory-core", "memory-lancedb"],
     });
   });
 
@@ -1307,12 +1307,12 @@ describe("resolveGatewayStartupPluginIds", () => {
     });
   });
 
-  it("does not include context-engine plugins not selected via the slot", () => {
+  it("includes explicitly enabled context-engine plugins even when they are not selected via the slot", () => {
     expectStartupPluginIdsCase({
       config: createStartupConfig({
         enabledPluginIds: ["lossless-claw"],
       }),
-      expected: ["demo-channel", "browser", "memory-core"],
+      expected: ["demo-channel", "browser", "memory-core", "lossless-claw"],
     });
   });
 

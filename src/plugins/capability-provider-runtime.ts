@@ -141,26 +141,15 @@ export function resolveManifestCapabilityProviderIds(params: {
   cfg?: OpenClawConfig;
   workspaceDir?: string;
 }): string[] {
+  if (shouldSkipCapabilityResolution(params)) {
+    return [];
+  }
   const contractKey = CAPABILITY_CONTRACT_KEY[params.key];
   return listAvailableManifestContractValues({
     snapshot: loadCapabilityManifestSnapshot(params),
     contract: contractKey,
     config: params.cfg,
   });
-}
-
-export function resolveBundledCapabilityProviderIds(params: {
-  key: CapabilityProviderRegistryKey;
-  cfg?: OpenClawConfig;
-  workspaceDir?: string;
-}): string[] {
-  const contractKey = CAPABILITY_CONTRACT_KEY[params.key];
-  const snapshot = loadCapabilityManifestSnapshot(params);
-  return uniqueSorted(
-    snapshot.plugins.flatMap((plugin) =>
-      plugin.origin === "bundled" ? (plugin.contracts?.[contractKey] ?? []) : [],
-    ),
-  );
 }
 
 function resolveCapabilityProviderConfig(params: {

@@ -141,6 +141,43 @@ describe("web-provider-runtime-shared", () => {
     );
   });
 
+  it("uses cached load options for runtime web provider fallback", () => {
+    const registry = {};
+    const mapRegistryProviders = vi.fn(() => ["mapped"]);
+    mocks.resolveRuntimePluginRegistry.mockReturnValue(undefined);
+    mocks.loadOpenClawPlugins.mockReturnValue(registry);
+
+    const providers = resolveRuntimeWebProviders(
+      {
+        config: {},
+        onlyPluginIds: ["alpha"],
+      },
+      {
+        resolveBundledResolutionConfig: () => ({
+          config: {},
+          activationSourceConfig: {},
+          autoEnabledReasons: {},
+        }),
+        resolveCandidatePluginIds: () => ["alpha"],
+        mapRegistryProviders,
+      },
+    );
+
+    expect(providers).toEqual(["mapped"]);
+    expect(mocks.resolveRuntimePluginRegistry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cache: true,
+        onlyPluginIds: ["alpha"],
+      }),
+    );
+    expect(mocks.loadOpenClawPlugins).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cache: true,
+        onlyPluginIds: ["alpha"],
+      }),
+    );
+  });
+
   it("preserves explicit scopes when config is omitted in direct runtime resolution", () => {
     const mapRegistryProviders = vi.fn(() => []);
     mocks.getLoadedRuntimePluginRegistry.mockReturnValue({} as never);

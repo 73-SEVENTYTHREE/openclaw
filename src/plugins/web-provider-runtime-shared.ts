@@ -1,6 +1,10 @@
 import { withActivatedPluginIds } from "./activation-context.js";
 import { getLoadedRuntimePluginRegistry } from "./active-runtime-registry.js";
-import { isPluginRegistryLoadInFlight, loadOpenClawPlugins } from "./loader.js";
+import {
+  isPluginRegistryLoadInFlight,
+  loadOpenClawPlugins,
+  resolveRuntimePluginRegistry,
+} from "./loader.js";
 import type { PluginLoadOptions } from "./loader.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
 import { hasExplicitPluginIdScope, normalizePluginIdScope } from "./plugin-scope.js";
@@ -211,16 +215,15 @@ export function resolveRuntimeWebProviders<TEntry>(
   params: Omit<ResolvePluginWebProvidersParams, "activate" | "cache" | "mode">,
   deps: ResolveWebProviderRuntimeDeps<TEntry>,
 ): TEntry[] {
-  const runtimeRegistry = getLoadedRuntimePluginRegistry({
-    env: params.env,
-    workspaceDir: params.workspaceDir,
-    requiredPluginIds: params.onlyPluginIds,
-  });
+  const runtimeParams = { ...params, cache: true };
+  const context = resolveWebProviderRuntimeContext(runtimeParams, deps);
+  const loadOptions = resolveWebProviderLoadOptions(context, runtimeParams);
+  const runtimeRegistry = resolveRuntimePluginRegistry(loadOptions);
   if (runtimeRegistry) {
     return deps.mapRegistryProviders({
       registry: runtimeRegistry,
-      onlyPluginIds: params.onlyPluginIds,
+      onlyPluginIds: context.onlyPluginIds,
     });
   }
-  return resolvePluginWebProviders(params, deps);
+  return resolvePluginWebProviders(runtimeParams, deps);
 }
