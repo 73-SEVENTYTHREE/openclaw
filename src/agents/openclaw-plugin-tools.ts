@@ -1,5 +1,6 @@
 import { selectApplicableRuntimeConfig } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import { resolvePluginTools } from "../plugins/tools.js";
 import { getActiveSecretsRuntimeSnapshot } from "../secrets/runtime.js";
 import { normalizeDeliveryContext } from "../utils/delivery-context.js";
@@ -10,6 +11,7 @@ import {
   type OpenClawPluginToolOptions,
 } from "./openclaw-tools.plugin-context.js";
 import { applyPluginToolDeliveryDefaults } from "./plugin-tool-delivery-defaults.js";
+import type { PreparedOpenClawToolPlanning } from "./runtime-plan/types.js";
 import type { AnyAgentTool } from "./tools/common.js";
 
 type ResolveOpenClawPluginToolsOptions = OpenClawPluginToolOptions & {
@@ -26,12 +28,15 @@ type ResolveOpenClawPluginToolsOptions = OpenClawPluginToolOptions & {
   disableMessageTool?: boolean;
   disablePluginTools?: boolean;
   authProfileStore?: AuthProfileStore;
+  preparedToolPlanning?: PreparedOpenClawToolPlanning;
 };
 
 export function resolveOpenClawPluginToolsForOptions(params: {
   options?: ResolveOpenClawPluginToolsOptions;
   resolvedConfig?: OpenClawConfig;
   existingToolNames?: Set<string>;
+  loadMetadataSnapshot?: () => PluginMetadataSnapshot;
+  metadataSnapshot?: PluginMetadataSnapshot;
 }): AnyAgentTool[] {
   if (params.options?.disablePluginTools) {
     return [];
@@ -63,6 +68,14 @@ export function resolveOpenClawPluginToolsForOptions(params: {
     existingToolNames: params.existingToolNames ?? new Set<string>(),
     toolAllowlist: params.options?.pluginToolAllowlist,
     allowGatewaySubagentBinding: params.options?.allowGatewaySubagentBinding,
+    ...(params.options?.preparedToolPlanning?.metadataSnapshot
+      ? { metadataSnapshot: params.options.preparedToolPlanning.metadataSnapshot }
+      : {}),
+    ...(params.options?.preparedToolPlanning?.loadMetadataSnapshot
+      ? { loadMetadataSnapshot: params.options.preparedToolPlanning.loadMetadataSnapshot }
+      : {}),
+    ...(params.metadataSnapshot ? { metadataSnapshot: params.metadataSnapshot } : {}),
+    ...(params.loadMetadataSnapshot ? { loadMetadataSnapshot: params.loadMetadataSnapshot } : {}),
     ...(authProfileStore
       ? {
           hasAuthForProvider: (providerId) =>

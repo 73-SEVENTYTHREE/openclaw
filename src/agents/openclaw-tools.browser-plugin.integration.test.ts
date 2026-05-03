@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
+import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import { activateSecretsRuntimeSnapshot, clearSecretsRuntimeSnapshot } from "../secrets/runtime.js";
 import { resolveOpenClawPluginToolsForOptions } from "./openclaw-plugin-tools.js";
 
@@ -138,6 +139,31 @@ describe("createOpenClawTools browser plugin integration", () => {
         allowGatewaySubagentBinding: true,
       }),
     );
+  });
+
+  it("forwards a shared metadata snapshot loader to plugin resolution", () => {
+    hoisted.resolvePluginTools.mockReturnValue([]);
+    const config = {
+      plugins: {
+        allow: ["browser"],
+      },
+    } as OpenClawConfig;
+    const loadMetadataSnapshot = vi.fn(
+      () => ({ plugins: [], index: {} }) as PluginMetadataSnapshot,
+    );
+
+    resolveOpenClawPluginToolsForOptions({
+      options: { config },
+      resolvedConfig: config,
+      loadMetadataSnapshot,
+    });
+
+    expect(hoisted.resolvePluginTools).toHaveBeenCalledWith(
+      expect.objectContaining({
+        loadMetadataSnapshot,
+      }),
+    );
+    expect(loadMetadataSnapshot).not.toHaveBeenCalled();
   });
 
   it("does not pass a stale active snapshot as plugin runtime config for a resolved run config", () => {

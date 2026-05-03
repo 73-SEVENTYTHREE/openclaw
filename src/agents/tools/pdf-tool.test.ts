@@ -159,6 +159,18 @@ describe("createPdfTool", () => {
     expect(() => createTool({ config: cfg })).toThrow("requires agentDir");
   });
 
+  it("creates the tool without eager model auth resolution", async () => {
+    await withTempPdfAgentDir(async (agentDir) => {
+      const tool = requirePdfTool((await loadCreatePdfTool())({ agentDir }));
+
+      const result = await tool.execute("t1", { pdf: "/tmp/doc.pdf" });
+
+      expect(result).toMatchObject({
+        details: { error: "pdf_model_unavailable" },
+      });
+    });
+  });
+
   it("creates tool when a PDF model is configured", async () => {
     await withConfiguredPdfTool(async (tool) => {
       expect(tool.name).toBe("pdf");

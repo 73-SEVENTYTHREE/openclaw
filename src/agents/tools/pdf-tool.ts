@@ -273,17 +273,15 @@ export function createPdfTool(options?: {
     return null;
   }
 
-  const shouldDeferAutoModelResolution =
-    options?.deferAutoModelResolution === true && !hasExplicitModelConfig;
-  const registrationPdfModelConfig = shouldDeferAutoModelResolution
-    ? null
-    : resolvePdfModelConfigForTool({
+  const registrationPdfModelConfig = hasExplicitModelConfig
+    ? resolvePdfModelConfigForTool({
         cfg: options?.config,
         agentDir,
         workspaceDir: options?.workspaceDir,
         authStore: options?.authProfileStore,
-      });
-  if (!registrationPdfModelConfig && !shouldDeferAutoModelResolution) {
+      })
+    : null;
+  if (hasExplicitModelConfig && !registrationPdfModelConfig) {
     return null;
   }
 
@@ -352,6 +350,17 @@ export function createPdfTool(options?: {
           authStore: options?.authProfileStore,
         });
       if (!pdfModelConfig) {
+        if (!options?.config) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "PDF analysis is unavailable because no PDF or image-capable model is configured with usable auth.",
+              },
+            ],
+            details: { error: "pdf_model_unavailable" },
+          };
+        }
         throw new ToolInputError("No PDF model configured.");
       }
 

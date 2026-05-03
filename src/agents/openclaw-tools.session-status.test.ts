@@ -241,6 +241,7 @@ vi.mock("../gateway/session-utils.js", createGatewaySessionUtilsModuleMock);
 vi.mock("../config/config.js", createConfigModuleMock);
 vi.mock("../agents/model-catalog.js", createModelCatalogModuleMock);
 vi.mock("../agents/provider-model-normalization.runtime.js", () => ({
+  getProviderModelNormalizationRuntimeCacheKey: () => "test-runtime",
   normalizeProviderModelIdWithRuntime: () => undefined,
 }));
 // Keep provider-runtime/plugin activation out of this focused tool test. The
