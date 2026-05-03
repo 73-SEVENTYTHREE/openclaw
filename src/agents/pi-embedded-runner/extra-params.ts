@@ -6,6 +6,7 @@ import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
   prepareProviderExtraParams as prepareProviderExtraParamsRuntime,
+  type ProviderRuntimePluginHandle,
   resolveProviderExtraParamsForTransport as resolveProviderExtraParamsForTransportRuntime,
   wrapProviderStreamFn as wrapProviderStreamFnRuntime,
 } from "../../plugins/provider-hook-runtime.js";
@@ -203,6 +204,7 @@ export function resolvePreparedExtraParams(params: {
   resolvedExtraParams?: Record<string, unknown>;
   model?: ProviderRuntimeModel;
   resolvedTransport?: SupportedTransport;
+  providerRuntimeHandle?: ProviderRuntimePluginHandle;
 }): Record<string, unknown> {
   const resolvedExtraParams =
     params.resolvedExtraParams ??
@@ -246,6 +248,7 @@ export function resolvePreparedExtraParams(params: {
       provider: params.provider,
       config: params.cfg,
       workspaceDir: params.workspaceDir,
+      runtimeHandle: params.providerRuntimeHandle,
       context: {
         config: params.cfg,
         agentDir: params.agentDir,
@@ -260,6 +263,7 @@ export function resolvePreparedExtraParams(params: {
     provider: params.provider,
     config: params.cfg,
     workspaceDir: params.workspaceDir,
+    runtimeHandle: params.providerRuntimeHandle,
     context: {
       config: params.cfg,
       agentDir: params.agentDir,
@@ -594,6 +598,7 @@ type ApplyExtraParamsContext = {
   effectiveExtraParams: Record<string, unknown>;
   resolvedExtraParams?: Record<string, unknown>;
   override?: Record<string, unknown>;
+  providerRuntimeHandle?: ProviderRuntimePluginHandle;
 };
 
 function applyPrePluginStreamWrappers(ctx: ApplyExtraParamsContext): void {
@@ -711,14 +716,20 @@ export function applyExtraParamsToAgent(
   model?: ProviderRuntimeModel,
   agentDir?: string,
   resolvedTransport?: SupportedTransport,
-  options?: { preparedExtraParams?: Record<string, unknown> },
+  options?: {
+    preparedExtraParams?: Record<string, unknown>;
+    providerRuntimeHandle?: ProviderRuntimePluginHandle;
+  },
 ): { effectiveExtraParams: Record<string, unknown> } {
-  const resolvedExtraParams = resolveExtraParams({
-    cfg,
-    provider,
-    modelId,
-    agentId,
-  });
+  const resolvedExtraParams =
+    options?.preparedExtraParams === undefined
+      ? resolveExtraParams({
+          cfg,
+          provider,
+          modelId,
+          agentId,
+        })
+      : undefined;
   const override =
     extraParamsOverride && Object.keys(extraParamsOverride).length > 0
       ? Object.fromEntries(
@@ -739,6 +750,7 @@ export function applyExtraParamsToAgent(
       resolvedExtraParams,
       model,
       resolvedTransport,
+      providerRuntimeHandle: options?.providerRuntimeHandle,
     });
   const wrapperContext: ApplyExtraParamsContext = {
     agent,
@@ -752,12 +764,14 @@ export function applyExtraParamsToAgent(
     effectiveExtraParams,
     resolvedExtraParams,
     override,
+    providerRuntimeHandle: options?.providerRuntimeHandle,
   };
 
   const providerStreamBase = agent.streamFn;
   const pluginWrappedStreamFn = providerRuntimeDeps.wrapProviderStreamFn({
     provider,
     config: cfg,
+    runtimeHandle: options?.providerRuntimeHandle,
     context: {
       config: cfg,
       agentDir,

@@ -2,11 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import {
-  createAgentSession,
-  DefaultResourceLoader,
-  SessionManager,
-} from "@mariozechner/pi-coding-agent";
+import { createAgentSession, SessionManager } from "@mariozechner/pi-coding-agent";
 import { isAcpRuntimeSpawnAvailable } from "../../../acp/runtime/availability.js";
 import { filterHeartbeatPairs } from "../../../auto-reply/heartbeat-filter.js";
 import { getRuntimeConfig } from "../../../config/config.js";
@@ -29,11 +25,6 @@ import {
   extractModelCompat,
   resolveToolCallArgumentsEncoding,
 } from "../../../plugins/provider-model-compat.js";
-import {
-  resolveProviderSystemPromptContribution,
-  resolveProviderTextTransforms,
-  transformProviderSystemPrompt,
-} from "../../../plugins/provider-runtime.js";
 import { getPluginToolMeta } from "../../../plugins/tools.js";
 import { isAcpSessionKey, isSubagentSessionKey } from "../../../routing/session-key.js";
 import { annotateInterSessionPromptText } from "../../../sessions/input-provenance.js";
@@ -81,7 +72,6 @@ import { resolveHeartbeatPromptForSystemPrompt } from "../../heartbeat-system-pr
 import { resolveImageSanitizationLimits } from "../../image-sanitization.js";
 import { stripRuntimeContextCustomMessages } from "../../internal-runtime-context.js";
 import { buildModelAliasLines } from "../../model-alias-lines.js";
-import { resolveModelAuthMode } from "../../model-auth.js";
 import { resolveDefaultModelForAgent } from "../../model-selection.js";
 import { supportsModelTools } from "../../model-tool-support.js";
 import { releaseWsSession } from "../../openai-ws-stream.js";
@@ -104,11 +94,7 @@ import {
 import { countActiveToolExecutions } from "../../pi-embedded-subscribe.handlers.tools.js";
 import { subscribeEmbeddedPiSession } from "../../pi-embedded-subscribe.js";
 import { createPreparedEmbeddedPiSettingsManager } from "../../pi-project-settings.js";
-import {
-  applyPiAutoCompactionGuard,
-  applyPiCompactionSettingsFromConfig,
-  isSilentOverflowProneModel,
-} from "../../pi-settings.js";
+import { applyPiAutoCompactionGuard, isSilentOverflowProneModel } from "../../pi-settings.js";
 import {
   createClientToolNameConflictError,
   findClientToolNameConflicts,
@@ -195,6 +181,7 @@ import {
   validateReplayTurns,
 } from "../replay-history.js";
 import { observeReplayMetadata, replayMetadataFromState } from "../replay-state.js";
+import { createEmbeddedPiResourceLoader } from "../resource-loader.js";
 import {
   clearActiveEmbeddedRun,
   type EmbeddedPiQueueHandle,
@@ -244,16 +231,13 @@ import {
   shouldStripBootstrapFromEmbeddedContext,
 } from "./attempt-bootstrap-routing.js";
 export { shouldStripBootstrapFromEmbeddedContext } from "./attempt-bootstrap-routing.js";
+import { createStageTracker, emitStageSummary } from "../../../infra/stage-timing.js";
 import {
   rotateTranscriptAfterCompaction,
   shouldRotateCompactionTranscript,
 } from "../compaction-successor-transcript.js";
 import { configureEmbeddedAttemptHttpRuntime } from "./attempt-http-runtime.js";
-import {
-  createEmbeddedRunStageTracker,
-  formatEmbeddedRunStageSummary,
-  shouldWarnEmbeddedRunStageSummary,
-} from "./attempt-stage-timing.js";
+import { EmbeddedRunStageName } from "./attempt-stage-timing.js";
 import {
   assembleAttemptContextEngine,
   buildLoopPromptCacheInfo,
@@ -291,6 +275,7 @@ import { wrapStreamFnHandleSensitiveStopReason } from "./attempt.stop-reason-rec
 import {
   buildEmbeddedSubscriptionParams,
   cleanupEmbeddedAttemptResources,
+  resolveEmbeddedSubscriptionFinalTag,
 } from "./attempt.subscription-cleanup.js";
 import {
   appendAttemptCacheTtlIfNeeded,
@@ -310,7 +295,10 @@ import {
   wrapStreamFnTrimToolCallNames,
 } from "./attempt.tool-call-normalization.js";
 import { buildEmbeddedAttemptToolRunContext } from "./attempt.tool-run-context.js";
-import { resolveAttemptTranscriptPolicy } from "./attempt.transcript-policy.js";
+import {
+  resolveAttemptTranscriptPolicy,
+  shouldPersistStrictTurnSessionRepair,
+} from "./attempt.transcript-policy.js";
 import { waitForCompactionRetryWithAggregateTimeout } from "./compaction-retry-aggregate-timeout.js";
 import {
   resolveRunTimeoutDuringCompaction,
@@ -611,14 +599,39 @@ export function shouldCreateBundleMcpRuntimeForAttempt(params: {
   disableTools?: boolean;
   toolsAllow?: string[];
 }): boolean {
+  return shouldCreateBundledCapabilityRuntimeForAttempt({
+    ...params,
+    matchesAllowedToolName: (toolName) =>
+      toolName === "bundle-mcp" || toolName.includes(TOOL_NAME_SEPARATOR),
+  });
+}
+
+export function shouldCreateBundleLspRuntimeForAttempt(params: {
+  toolsEnabled: boolean;
+  disableTools?: boolean;
+  toolsAllow?: string[];
+}): boolean {
+  return shouldCreateBundledCapabilityRuntimeForAttempt({
+    ...params,
+    matchesAllowedToolName: (toolName) =>
+      toolName === "bundle-lsp" || toolName === "lsp" || toolName.startsWith("lsp_"),
+  });
+}
+
+function shouldCreateBundledCapabilityRuntimeForAttempt(params: {
+  toolsEnabled: boolean;
+  disableTools?: boolean;
+  toolsAllow?: string[];
+  matchesAllowedToolName: (normalizedToolName: string) => boolean;
+}): boolean {
   if (!params.toolsEnabled || params.disableTools === true) {
     return false;
   }
   if (!params.toolsAllow || params.toolsAllow.length === 0) {
     return true;
   }
-  return params.toolsAllow.some(
-    (toolName) => toolName === "bundle-mcp" || toolName.includes(TOOL_NAME_SEPARATOR),
+  return params.toolsAllow.some((toolName) =>
+    params.matchesAllowedToolName(normalizeToolName(toolName)),
   );
 }
 
@@ -712,22 +725,14 @@ export async function runEmbeddedAttempt(
   log.debug(
     `embedded run start: runId=${params.runId} sessionId=${params.sessionId} provider=${params.provider} model=${params.modelId} thinking=${params.thinkLevel} messageChannel=${params.messageChannel ?? params.messageProvider ?? "unknown"}`,
   );
-  const prepStages = createEmbeddedRunStageTracker();
+  const prepStages = createStageTracker();
+  let prepStageSummaryCompleted = false;
   const emitPrepStageSummary = (phase: string) => {
-    const summary = prepStages.snapshot();
-    const shouldWarn = shouldWarnEmbeddedRunStageSummary(summary);
-    if (!shouldWarn && !log.isEnabled("trace")) {
-      return;
-    }
-    const message = formatEmbeddedRunStageSummary(
-      `[trace:embedded-run] prep stages: runId=${params.runId} sessionId=${params.sessionId} phase=${phase}`,
-      summary,
-    );
-    if (shouldWarn) {
-      log.warn(message);
-    } else {
-      log.trace(message);
-    }
+    emitStageSummary({
+      logger: log,
+      prefix: `[timing:embedded-run] prep stages: runId=${params.runId} sessionId=${params.sessionId} phase=${phase}`,
+      summary: prepStages.snapshot(),
+    });
   };
   const emitCorePluginToolStageSummary = (
     phase: string,
@@ -736,22 +741,14 @@ export async function runEmbeddedAttempt(
     if (summary.stages.length === 0) {
       return;
     }
-    const shouldWarn = shouldWarnEmbeddedRunStageSummary(summary, {
+    emitStageSummary({
+      logger: log,
+      prefix: `[trace:embedded-run] core-plugin-tool stages: runId=${params.runId} sessionId=${params.sessionId} phase=${phase}`,
+      summary,
+      normalLevel: "trace",
       totalThresholdMs: 5_000,
       stageThresholdMs: 2_000,
     });
-    if (!shouldWarn && !log.isEnabled("trace")) {
-      return;
-    }
-    const message = formatEmbeddedRunStageSummary(
-      `[trace:embedded-run] core-plugin-tool stages: runId=${params.runId} sessionId=${params.sessionId} phase=${phase}`,
-      summary,
-    );
-    if (shouldWarn) {
-      log.warn(message);
-    } else {
-      log.trace(message);
-    }
   };
 
   await fs.mkdir(resolvedWorkspace, { recursive: true });
@@ -778,7 +775,7 @@ export async function runEmbeddedAttempt(
     config: params.config,
     sessionAgentId,
   });
-  prepStages.mark("workspace-sandbox");
+  prepStages.mark(EmbeddedRunStageName.workspaceSessionPrep);
 
   let restoreSkillEnv: (() => void) | undefined;
   let aborted = Boolean(params.abortSignal?.aborted);
@@ -815,7 +812,7 @@ export async function runEmbeddedAttempt(
       workspaceDir: effectiveWorkspace,
       agentId: sessionAgentId,
     });
-    prepStages.mark("skills");
+    prepStages.mark(EmbeddedRunStageName.skillPrep);
 
     const sessionLabel = params.sessionKey ?? params.sessionId;
     const contextInjectionMode = resolveContextInjectionMode(params.config);
@@ -864,9 +861,10 @@ export async function runEmbeddedAttempt(
         ...(err ? { errorCategory: diagnosticErrorCategory(err) } : {}),
       });
     };
-    const corePluginToolStages = createEmbeddedRunStageTracker();
+    const corePluginToolStages = createStageTracker();
+    const toolsEnabled = supportsModelTools(params.model);
     const toolsRaw =
-      params.disableTools || isRawModelRun
+      params.disableTools || isRawModelRun || !toolsEnabled
         ? []
         : (() => {
             const allTools = createOpenClawCodingTools({
@@ -911,9 +909,6 @@ export async function runEmbeddedAttempt(
               modelCompat: extractModelCompat(params.model),
               modelApi: params.model.api,
               modelContextWindowTokens: params.model.contextWindow,
-              modelAuthMode: resolveModelAuthMode(params.model.provider, params.config, undefined, {
-                workspaceDir: effectiveWorkspace,
-              }),
               currentChannelId: params.currentChannelId,
               currentThreadTs: params.currentThreadTs,
               currentMessageId: params.currentMessageId,
@@ -928,6 +923,7 @@ export async function runEmbeddedAttempt(
               enableHeartbeatTool: params.enableHeartbeatTool,
               forceHeartbeatTool: params.forceHeartbeatTool,
               authProfileStore: params.authProfileStore,
+              preparedToolPlanning: params.runtimePlan.tools.preparedPlanning,
               recordToolPrepStage: (name) => corePluginToolStages.mark(name),
               onYield: (message) => {
                 yieldDetected = true;
@@ -942,9 +938,9 @@ export async function runEmbeddedAttempt(
             corePluginToolStages.mark("attempt:tools-allow");
             return filteredTools;
           })();
-    prepStages.mark("core-plugin-tools");
+    prepStages.mark(EmbeddedRunStageName.toolPlanning);
+    prepStages.mark(EmbeddedRunStageName.toolMaterialization);
     emitCorePluginToolStageSummary("core-plugin-tools", corePluginToolStages.snapshot());
-    const toolsEnabled = supportsModelTools(params.model);
     const bootstrapHasFileAccess = toolsEnabled && toolsRaw.some((tool) => tool.name === "read");
     const bootstrapRouting = await resolveAttemptWorkspaceBootstrapRouting({
       isWorkspaceBootstrapPending,
@@ -987,7 +983,7 @@ export async function runEmbeddedAttempt(
           runKind: params.bootstrapContextRunKind,
         }),
     });
-    prepStages.mark("bootstrap-context");
+    prepStages.mark(EmbeddedRunStageName.bootstrapContext);
     const remappedContextFiles = remapInjectedContextFilesToWorkspace({
       files: resolvedContextFiles,
       sourceWorkspaceDir: resolvedWorkspace,
@@ -1081,18 +1077,22 @@ export async function runEmbeddedAttempt(
           ],
         })
       : undefined;
-    const bundleLspRuntime =
-      toolsEnabled && !isRawModelRun
-        ? await createBundleLspToolRuntime({
-            workspaceDir: effectiveWorkspace,
-            cfg: params.config,
-            reservedToolNames: [
-              ...tools.map((tool) => tool.name),
-              ...(clientTools?.map((tool) => tool.function.name) ?? []),
-              ...(bundleMcpRuntime?.tools.map((tool) => tool.name) ?? []),
-            ],
-          })
-        : undefined;
+    const bundleLspEnabled = shouldCreateBundleLspRuntimeForAttempt({
+      toolsEnabled,
+      disableTools: params.disableTools || isRawModelRun,
+      toolsAllow: params.toolsAllow,
+    });
+    const bundleLspRuntime = bundleLspEnabled
+      ? await createBundleLspToolRuntime({
+          workspaceDir: effectiveWorkspace,
+          cfg: params.config,
+          reservedToolNames: [
+            ...tools.map((tool) => tool.name),
+            ...(clientTools?.map((tool) => tool.function.name) ?? []),
+            ...(bundleMcpRuntime?.tools.map((tool) => tool.name) ?? []),
+          ],
+        })
+      : undefined;
     const filteredBundledTools = applyFinalEffectiveToolPolicy({
       bundledTools: [...(bundleMcpRuntime?.tools ?? []), ...(bundleLspRuntime?.tools ?? [])],
       config: params.config,
@@ -1116,7 +1116,7 @@ export async function runEmbeddedAttempt(
       warn: (message) => log.warn(message),
     });
     const effectiveTools = [...tools, ...filteredBundledTools];
-    prepStages.mark("bundle-tools");
+    prepStages.mark(EmbeddedRunStageName.pluginCapabilityLoading);
     const allowedToolNames = collectAllowedToolNames({
       tools: effectiveTools,
       clientTools,
@@ -1179,9 +1179,15 @@ export async function runEmbeddedAttempt(
       config: params.config,
       workspaceDir: effectiveWorkspace,
       env: process.env,
+      runtimeHandle: params.runtimePlan.providerRuntimeHandle,
       modelId: params.modelId,
       modelApi: params.model.api,
       model: params.model,
+    });
+    const enforceFinalTag = resolveEmbeddedSubscriptionFinalTag({
+      enforceFinalTag: params.enforceFinalTag,
+      reasoningTagHint,
+      skipProviderRuntimeHints: params.skipProviderRuntimeHints,
     });
     // Resolve channel-specific message actions for system prompt
     const channelActions = runtimeChannel
@@ -1276,13 +1282,7 @@ export async function runEmbeddedAttempt(
       trigger: params.trigger,
     };
     const promptContribution =
-      params.runtimePlan?.prompt.resolveSystemPromptContribution(promptContributionContext) ??
-      resolveProviderSystemPromptContribution({
-        provider: params.provider,
-        config: params.config,
-        workspaceDir: effectiveWorkspace,
-        context: promptContributionContext,
-      });
+      params.runtimePlan.prompt.resolveSystemPromptContribution(promptContributionContext);
 
     const builtAppendPrompt =
       resolveSystemPromptOverride({
@@ -1328,22 +1328,17 @@ export async function runEmbeddedAttempt(
       });
     const appendPrompt = isRawModelRun
       ? ""
-      : transformProviderSystemPrompt({
-          provider: params.provider,
+      : params.runtimePlan.prompt.transformSystemPrompt({
           config: params.config,
+          agentDir: params.agentDir,
           workspaceDir: effectiveWorkspace,
-          context: {
-            config: params.config,
-            agentDir: params.agentDir,
-            workspaceDir: effectiveWorkspace,
-            provider: params.provider,
-            modelId: params.modelId,
-            promptMode: effectivePromptMode,
-            runtimeChannel,
-            runtimeCapabilities,
-            agentId: sessionAgentId,
-            systemPrompt: builtAppendPrompt,
-          },
+          provider: params.provider,
+          modelId: params.modelId,
+          promptMode: effectivePromptMode,
+          runtimeChannel,
+          runtimeCapabilities,
+          agentId: sessionAgentId,
+          systemPrompt: builtAppendPrompt,
         });
     const systemPromptReport = buildSystemPromptReport({
       source: "run",
@@ -1380,7 +1375,7 @@ export async function runEmbeddedAttempt(
       bootstrapMode,
       contextFiles: remappedContextFiles,
     });
-    prepStages.mark("system-prompt");
+    prepStages.mark(EmbeddedRunStageName.systemPrompt);
 
     // Keep the session lock scoped to transcript/session mutations. Cold plugin
     // and tool setup can be slow, and holding the lock there blocks CLI fallback
@@ -1395,6 +1390,7 @@ export async function runEmbeddedAttempt(
         }),
       }),
     });
+    prepStages.mark(EmbeddedRunStageName.sessionWriteLock);
 
     let sessionManager: ReturnType<typeof guardSessionManager> | undefined;
     let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
@@ -1402,16 +1398,6 @@ export async function runEmbeddedAttempt(
     let trajectoryRecorder: ReturnType<typeof createTrajectoryRuntimeRecorder> | null = null;
     let trajectoryEndRecorded = false;
     try {
-      await repairSessionFileIfNeeded({
-        sessionFile: params.sessionFile,
-        debug: (message) => log.debug(message),
-        warn: (message) => log.warn(message),
-      });
-      const hadSessionFile = await fs
-        .stat(params.sessionFile)
-        .then(() => true)
-        .catch(() => false);
-
       const transcriptPolicy = resolveAttemptTranscriptPolicy({
         runtimePlan: params.runtimePlan,
         runtimePlanModelContext,
@@ -1420,6 +1406,17 @@ export async function runEmbeddedAttempt(
         config: params.config,
         env: process.env,
       });
+      await repairSessionFileIfNeeded({
+        sessionFile: params.sessionFile,
+        debug: (message) => log.debug(message),
+        trimTrailingAssistantMessages: shouldPersistStrictTurnSessionRepair(transcriptPolicy),
+        warn: (message) => log.warn(message),
+      });
+      prepStages.mark(EmbeddedRunStageName.sessionTranscriptRepair);
+      const hadSessionFile = await fs
+        .stat(params.sessionFile)
+        .then(() => true)
+        .catch(() => false);
 
       await prewarmSessionFile(params.sessionFile);
       sessionManager = guardSessionManager(SessionManager.open(params.sessionFile), {
@@ -1442,6 +1439,7 @@ export async function runEmbeddedAttempt(
         },
       });
       trackSessionManagerAccess(params.sessionFile);
+      prepStages.mark(EmbeddedRunStageName.sessionManagerOpen);
 
       await runAttemptContextEngineBootstrap({
         hadSessionFile,
@@ -1469,6 +1467,7 @@ export async function runEmbeddedAttempt(
           }),
         warn: (message) => log.warn(message),
       });
+      prepStages.mark(EmbeddedRunStageName.contextEngineBootstrap);
 
       await prepareSessionManagerForRun({
         sessionManager,
@@ -1477,6 +1476,7 @@ export async function runEmbeddedAttempt(
         sessionId: params.sessionId,
         cwd: effectiveWorkspace,
       });
+      prepStages.mark(EmbeddedRunStageName.sessionManagerPrepare);
 
       const settingsManager = createPreparedEmbeddedPiSettingsManager({
         cwd: effectiveWorkspace,
@@ -1494,34 +1494,37 @@ export async function runEmbeddedAttempt(
         }),
       };
       applyPiAutoCompactionGuard(piAutoCompactionGuardArgs);
+      prepStages.mark(EmbeddedRunStageName.piSettings);
 
       // Sets compaction/pruning runtime state and returns extension factories
       // that must be passed to the resource loader for the safeguard to be active.
+      const cacheTtlProviderEligible =
+        params.config?.agents?.defaults?.contextPruning?.mode === "cache-ttl"
+          ? isCacheTtlEligibleProvider(params.provider, params.modelId, params.model.api, {
+              config: params.config,
+              workspaceDir: effectiveWorkspace,
+              env: process.env,
+              runtimeHandle: params.runtimePlan.providerRuntimeHandle,
+            })
+          : false;
       const extensionFactories = buildEmbeddedExtensionFactories({
         cfg: params.config,
         sessionManager,
         provider: params.provider,
         modelId: params.modelId,
         model: params.model,
+        workspaceDir: effectiveWorkspace,
+        env: process.env,
+        providerRuntimeHandle: params.runtimePlan.providerRuntimeHandle,
+        cacheTtlProviderEligible,
       });
-      const resourceLoader = new DefaultResourceLoader({
-        cwd: resolvedWorkspace,
-        agentDir,
-        settingsManager,
+      prepStages.mark(EmbeddedRunStageName.extensionFactoryBuild);
+      const resourceLoader = createEmbeddedPiResourceLoader({
         extensionFactories,
       });
+      prepStages.mark(EmbeddedRunStageName.resourceLoaderCreate);
       await resourceLoader.reload();
-      // DefaultResourceLoader.reload() rehydrates settings from disk and can drop OpenClaw
-      // compaction overrides applied in createPreparedEmbeddedPiSettingsManager — same
-      // rehydration also restores Pi's auto-compaction (openclaw#75799), so re-apply
-      // both guards.
-      applyPiCompactionSettingsFromConfig({
-        settingsManager,
-        cfg: params.config,
-        contextTokenBudget: params.contextTokenBudget,
-      });
-      applyPiAutoCompactionGuard(piAutoCompactionGuardArgs);
-      prepStages.mark("session-resource-loader");
+      prepStages.mark(EmbeddedRunStageName.sessionResourceLoader);
 
       // Get hook runner early so it's available when creating tools
       const hookRunner = getGlobalHookRunner();
@@ -1663,7 +1666,7 @@ export async function runEmbeddedAttempt(
       }
       session.setActiveToolsByName(sessionToolAllowlist);
       const activeSession = session;
-      prepStages.mark("agent-session");
+      prepStages.mark(EmbeddedRunStageName.agentSession);
       if (isRawModelRun) {
         // Raw model probes should measure exactly the requested prompt against
         // the selected provider/model. Reset clears restored transcript state
@@ -1882,6 +1885,7 @@ export async function runEmbeddedAttempt(
         cfg: params.config,
         agentDir,
         workspaceDir: effectiveWorkspace,
+        providerRuntimeHandle: params.runtimePlan.providerRuntimeHandle,
       });
       const shouldUseWebSocketTransport = shouldUseOpenAIWebSocketTransportForAttempt({
         provider: params.provider,
@@ -1920,17 +1924,13 @@ export async function runEmbeddedAttempt(
         model: params.model,
         resolvedApiKey: params.resolvedApiKey,
         authStorage: params.authStorage,
+        providerRuntimeHandle: params.runtimePlan.providerRuntimeHandle,
       });
-      const providerTextTransforms = resolveProviderTextTransforms({
-        provider: params.provider,
-        config: params.config,
-        workspaceDir: effectiveWorkspace,
-      });
-      if (providerTextTransforms) {
+      if (params.runtimePlan.prompt.textTransforms) {
         activeSession.agent.streamFn = wrapStreamFnTextTransforms({
           streamFn: activeSession.agent.streamFn,
-          input: providerTextTransforms.input,
-          output: providerTextTransforms.output,
+          input: params.runtimePlan.prompt.textTransforms.input,
+          output: params.runtimePlan.prompt.textTransforms.output,
           transformSystemPrompt: false,
         });
       }
@@ -1947,7 +1947,10 @@ export async function runEmbeddedAttempt(
         params.model,
         agentDir,
         resolvedTransport,
-        { preparedExtraParams: effectiveExtraParams },
+        {
+          preparedExtraParams: effectiveExtraParams,
+          providerRuntimeHandle: params.runtimePlan.providerRuntimeHandle,
+        },
       );
       const effectivePromptCacheRetention = resolveCacheRetention(
         effectiveExtraParams,
@@ -1967,7 +1970,7 @@ export async function runEmbeddedAttempt(
             `(${params.provider}/${params.modelId})`,
         );
       }
-      prepStages.mark("stream-setup");
+      prepStages.mark(EmbeddedRunStageName.streamSetup);
       emitPrepStageSummary("stream-ready");
 
       const cacheObservabilityEnabled = Boolean(cacheTrace) || log.isEnabled("debug");
@@ -1984,6 +1987,7 @@ export async function runEmbeddedAttempt(
         });
         activeSession.agent.streamFn = cacheTrace.wrapStreamFn(activeSession.agent.streamFn);
       }
+      prepStages.mark(EmbeddedRunStageName.promptCacheTraceSetup);
 
       // Anthropic Claude endpoints can reject replayed `thinking` blocks
       // (e.g. thinkingSignature:"reasoning_text") on any follow-up provider
@@ -2173,6 +2177,7 @@ export async function runEmbeddedAttempt(
           nextCallId: () => `${params.runId}:model:${(diagnosticModelCallSeq += 1)}`,
         },
       );
+      prepStages.mark(EmbeddedRunStageName.streamWrapperSetup);
 
       try {
         if (isRawModelRun) {
@@ -2197,6 +2202,7 @@ export async function runEmbeddedAttempt(
             sessionManager,
             sessionId: params.sessionId,
             policy: transcriptPolicy,
+            runtimeHandle: params.runtimePlan.providerRuntimeHandle,
           });
           cacheTrace?.recordStage("session:sanitized", { messages: prior });
           const validated = await validateReplayTurns({
@@ -2210,6 +2216,7 @@ export async function runEmbeddedAttempt(
             model: params.model,
             sessionId: params.sessionId,
             policy: transcriptPolicy,
+            runtimeHandle: params.runtimePlan.providerRuntimeHandle,
           });
           const heartbeatSummary =
             params.config && sessionAgentId
@@ -2293,6 +2300,7 @@ export async function runEmbeddedAttempt(
         activeSession.dispose();
         throw err;
       }
+      prepStages.mark(EmbeddedRunStageName.sessionHistoryPrepare);
 
       let yieldAborted = false;
       const getAbortReason = (signal: AbortSignal): unknown =>
@@ -2344,7 +2352,7 @@ export async function runEmbeddedAttempt(
           session: activeSession,
           runId: params.runId,
           initialReplayState: params.initialReplayState,
-          hookRunner: getGlobalHookRunner() ?? undefined,
+          hookRunner: hookRunner ?? undefined,
           verboseLevel: params.verboseLevel,
           reasoningMode: params.reasoningLevel ?? "off",
           thinkingLevel: params.thinkLevel,
@@ -2366,7 +2374,7 @@ export async function runEmbeddedAttempt(
             // post-completion cleanup does not observe a logically finished run as active.
             clearActiveEmbeddedRun(params.sessionId, queueHandle, params.sessionKey);
           },
-          enforceFinalTag: params.enforceFinalTag,
+          enforceFinalTag,
           silentExpected: params.silentExpected,
           config: params.config,
           sessionKey: sandboxSessionKey,
@@ -2376,6 +2384,7 @@ export async function runEmbeddedAttempt(
           internalEvents: params.internalEvents,
         }),
       );
+      prepStages.mark(EmbeddedRunStageName.subscriptionSetup);
 
       const {
         assistantTexts,
@@ -2427,6 +2436,7 @@ export async function runEmbeddedAttempt(
         params.replyOperation.attachBackend(queueHandle);
       }
       setActiveEmbeddedRun(params.sessionId, queueHandle, params.sessionKey);
+      prepStages.mark(EmbeddedRunStageName.activeRunRegistration);
 
       let abortWarnTimer: NodeJS.Timeout | undefined;
       const isProbeSession = params.sessionId?.startsWith("probe-") ?? false;
@@ -3045,8 +3055,30 @@ export async function runEmbeddedAttempt(
               messages: btwSnapshotMessages,
               inFlightPrompt: promptForModel,
             });
+            let modelRequestPrepared = false;
+            const markModelRequestPrep = () => {
+              if (!modelRequestPrepared) {
+                prepStages.mark(EmbeddedRunStageName.modelRequestPrep);
+                modelRequestPrepared = true;
+              }
+            };
+            const submitPromptToModel = async (
+              promptText: string,
+              options?: Parameters<typeof activeSession.prompt>[1],
+            ) => {
+              try {
+                const promptPromise =
+                  options === undefined
+                    ? activeSession.prompt(promptText)
+                    : activeSession.prompt(promptText, options);
+                markModelRequestPrep();
+                await abortable(promptPromise);
+              } finally {
+                prepStages.mark(EmbeddedRunStageName.modelExecution);
+              }
+            };
             if (promptSubmission.runtimeOnly) {
-              await abortable(activeSession.prompt(promptForModel));
+              await submitPromptToModel(promptForModel);
             } else {
               const runtimeContext = promptSubmission.runtimeContext?.trim();
               const runtimeSystemPrompt = runtimeContext
@@ -3067,11 +3099,11 @@ export async function runEmbeddedAttempt(
                 // Only pass images option if there are actually images to pass
                 // This avoids potential issues with models that don't expect the images parameter
                 if (imageResult.images.length > 0) {
-                  await abortable(
-                    activeSession.prompt(promptForModel, { images: imageResult.images }),
-                  );
+                  await submitPromptToModel(promptForModel, {
+                    images: imageResult.images,
+                  });
                 } else {
-                  await abortable(activeSession.prompt(promptForModel));
+                  await submitPromptToModel(promptForModel);
                 }
               } finally {
                 if (runtimeSystemPrompt) {
@@ -3108,6 +3140,7 @@ export async function runEmbeddedAttempt(
             `embedded run prompt end: runId=${params.runId} sessionId=${params.sessionId} durationMs=${Date.now() - promptStartedAt}`,
           );
         }
+        prepStages.mark(EmbeddedRunStageName.promptFinalization);
 
         if (pendingMidTurnPrecheckRequest) {
           const request = pendingMidTurnPrecheckRequest;
@@ -3177,6 +3210,7 @@ export async function runEmbeddedAttempt(
             throw err;
           }
         }
+        prepStages.mark(EmbeddedRunStageName.compactionRetryWait);
 
         // Check if ANY compaction occurred during the entire attempt (prompt + retry).
         // Using a cumulative count (> 0) instead of a delta check avoids missing
@@ -3198,8 +3232,7 @@ export async function runEmbeddedAttempt(
           config: params.config,
           provider: params.provider,
           modelId: params.modelId,
-          modelApi: params.model.api,
-          isCacheTtlEligibleProvider,
+          cacheTtlProviderEligible,
         });
 
         // If timeout occurred during compaction, use pre-compaction snapshot when available
@@ -3268,6 +3301,7 @@ export async function runEmbeddedAttempt(
             fallbackLastCacheTouchAt,
           }),
         });
+        prepStages.mark(EmbeddedRunStageName.attemptStateCapture);
 
         if (promptError && promptErrorSource === "prompt" && !compactionOccurredThisAttempt) {
           try {
@@ -3410,6 +3444,7 @@ export async function runEmbeddedAttempt(
               log.warn(`agent_end hook failed: ${err}`);
             });
         }
+        prepStages.mark(EmbeddedRunStageName.contextEngineFinalize);
       } finally {
         clearTimeout(abortTimer);
         if (abortWarnTimer) {
@@ -3436,6 +3471,7 @@ export async function runEmbeddedAttempt(
         clearActiveEmbeddedRun(params.sessionId, queueHandle, params.sessionKey);
         params.abortSignal?.removeEventListener?.("abort", onAbort);
       }
+      prepStages.mark(EmbeddedRunStageName.subscriptionCleanup);
 
       const toolMetasNormalized = toolMetas
         .filter(
@@ -3492,10 +3528,8 @@ export async function runEmbeddedAttempt(
               sessionId: params.sessionId,
               provider: params.provider,
               model: params.modelId,
-              resolvedRef:
-                params.runtimePlan?.observability.resolvedRef ??
-                `${params.provider}/${params.modelId}`,
-              ...(params.runtimePlan?.observability.harnessId
+              resolvedRef: params.runtimePlan.observability.resolvedRef,
+              ...(params.runtimePlan.observability.harnessId
                 ? { harnessId: params.runtimePlan.observability.harnessId }
                 : {}),
               assistantTexts,
@@ -3583,6 +3617,9 @@ export async function runEmbeddedAttempt(
         promptError: promptError ? formatErrorMessage(promptError) : undefined,
       });
       trajectoryEndRecorded = true;
+      prepStages.mark(EmbeddedRunStageName.attemptResultBuild);
+      emitPrepStageSummary("attempt-complete");
+      prepStageSummaryCompleted = true;
 
       const completedClientToolCalls = clientToolCallSlots.flatMap((slot) =>
         slot.completed && slot.params
@@ -3643,6 +3680,10 @@ export async function runEmbeddedAttempt(
         yieldDetected: yieldDetected || undefined,
       };
     } finally {
+      if (!prepStageSummaryCompleted) {
+        emitPrepStageSummary("cleanup");
+        prepStageSummaryCompleted = true;
+      }
       if (trajectoryRecorder && !trajectoryEndRecorded) {
         trajectoryRecorder.recordEvent("session.ended", {
           status: promptError ? "error" : aborted || timedOut ? "interrupted" : "cleanup",
@@ -3703,6 +3744,10 @@ export async function runEmbeddedAttempt(
       }
     }
   } finally {
+    if (!prepStageSummaryCompleted) {
+      emitPrepStageSummary("cleanup");
+      prepStageSummaryCompleted = true;
+    }
     emitDiagnosticRunCompleted?.(
       aborted ? "aborted" : "error",
       promptError ?? new Error("run exited before diagnostic completion"),

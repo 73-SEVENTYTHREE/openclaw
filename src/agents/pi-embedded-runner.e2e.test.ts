@@ -326,6 +326,43 @@ describe("runEmbeddedPiAgent", () => {
     expect(ensureOpenClawModelsJsonMock).not.toHaveBeenCalled();
   });
 
+  it("scopes models.json generation to the selected provider when PI discovery is needed", async () => {
+    const sessionFile = nextSessionFile();
+    const cfg = createEmbeddedPiRunnerOpenAiConfig(["gpt-5.4"]);
+    resolveModelAsyncMock.mockImplementationOnce(async () => ({
+      model: null,
+      error: "dynamic miss",
+      authStorage: {},
+      modelRegistry: {},
+    }));
+    runEmbeddedAttemptMock.mockResolvedValueOnce(
+      makeEmbeddedRunnerAttempt({
+        assistantTexts: ["ok"],
+        lastAssistant: buildEmbeddedRunnerAssistant({
+          content: [{ type: "text", text: "ok" }],
+        }),
+      }),
+    );
+
+    await runEmbeddedPiAgent({
+      sessionId: "scoped-models-json",
+      sessionFile,
+      workspaceDir,
+      config: cfg,
+      prompt: "hello",
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      timeoutMs: 5_000,
+      agentDir,
+      runId: nextRunId("scoped-models-json"),
+      enqueue: immediateEnqueue,
+    });
+
+    expect(ensureOpenClawModelsJsonMock).toHaveBeenCalledWith(cfg, agentDir, {
+      providerDiscoveryProviderIds: ["openai-codex"],
+    });
+  });
+
   it("backfills a trimmed session key from sessionId when the embedded run omits it", async () => {
     const sessionFile = nextSessionFile();
     const cfg = createEmbeddedPiRunnerOpenAiConfig(["mock-1"]);

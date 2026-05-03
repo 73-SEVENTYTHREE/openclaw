@@ -117,6 +117,73 @@ function createEmptyPiDiscoveryStores(): {
   return { authStorage, modelRegistry };
 }
 
+type ResolvedModelAsyncResult = {
+  model?: Model<Api>;
+  error?: string;
+  authStorage: AuthStorage;
+  modelRegistry: ModelRegistry;
+};
+
+const SKIP_PI_DISCOVERY_MODEL_CACHE_MAX = 128;
+const skipPiDiscoveryModelCache = new Map<string, Promise<ResolvedModelAsyncResult>>();
+
+function resolveSkipPiDiscoveryModelCacheKey(params: {
+  provider: string;
+  modelId: string;
+  agentDir: string;
+  cfg?: OpenClawConfig;
+}): string {
+  const providerConfig = JSON.stringify(
+    resolveConfiguredProviderConfig(params.cfg, params.provider) ?? null,
+  );
+  return [params.provider, params.modelId, params.agentDir, providerConfig].join("\0");
+}
+
+function shouldCacheSkipPiDiscoveryModelResolution(options?: {
+  authStorage?: AuthStorage;
+  modelRegistry?: ModelRegistry;
+  retryTransientProviderRuntimeMiss?: boolean;
+  runtimeHooks?: ProviderRuntimeHooks;
+  skipProviderRuntimeHooks?: boolean;
+  skipPiDiscovery?: boolean;
+}): boolean {
+  return (
+    options?.skipPiDiscovery === true &&
+    !options.authStorage &&
+    !options.modelRegistry &&
+    !options.retryTransientProviderRuntimeMiss &&
+    !options.runtimeHooks &&
+    options.skipProviderRuntimeHooks !== true
+  );
+}
+
+function rememberSkipPiDiscoveryModelResolution(
+  key: string,
+  promise: Promise<ResolvedModelAsyncResult>,
+): Promise<ResolvedModelAsyncResult> {
+  skipPiDiscoveryModelCache.set(key, promise);
+  while (skipPiDiscoveryModelCache.size > SKIP_PI_DISCOVERY_MODEL_CACHE_MAX) {
+    const oldestKey = skipPiDiscoveryModelCache.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+    skipPiDiscoveryModelCache.delete(oldestKey);
+  }
+  return promise
+    .then((result) => {
+      if (!result.model && skipPiDiscoveryModelCache.get(key) === promise) {
+        skipPiDiscoveryModelCache.delete(key);
+      }
+      return result;
+    })
+    .catch((error) => {
+      if (skipPiDiscoveryModelCache.get(key) === promise) {
+        skipPiDiscoveryModelCache.delete(key);
+      }
+      throw error;
+    });
+}
+
 function resolveRuntimeHooks(params?: {
   runtimeHooks?: ProviderRuntimeHooks;
   skipProviderRuntimeHooks?: boolean;
@@ -1042,28 +1109,99 @@ export async function resolveModelAsync(
     model: normalizeStaticProviderModelId(normalizeProviderId(provider), modelId),
   };
   const resolvedAgentDir = agentDir ?? resolveOpenClawAgentDir();
-  const emptyDiscoveryStores =
-    options?.skipPiDiscovery && (!options.authStorage || !options.modelRegistry)
-      ? createEmptyPiDiscoveryStores()
-      : undefined;
-  const authStorage =
-    options?.authStorage ??
-    emptyDiscoveryStores?.authStorage ??
-    discoverAuthStorage(resolvedAgentDir);
-  const modelRegistry =
-    options?.modelRegistry ??
-    emptyDiscoveryStores?.modelRegistry ??
-    discoverModels(authStorage, resolvedAgentDir);
-  const runtimeHooks = resolveRuntimeHooks(options);
-  const explicitModel = resolveExplicitModelWithRegistry({
-    provider: normalizedRef.provider,
-    modelId: normalizedRef.model,
-    modelRegistry,
-    cfg,
-    agentDir: resolvedAgentDir,
-    runtimeHooks,
-  });
-  if (explicitModel?.kind === "suppressed") {
+  const cacheKey = shouldCacheSkipPiDiscoveryModelResolution(options)
+    ? resolveSkipPiDiscoveryModelCacheKey({
+        provider: normalizedRef.provider,
+        modelId: normalizedRef.model,
+        agentDir: resolvedAgentDir,
+        cfg,
+      })
+    : undefined;
+  if (cacheKey) {
+    const cached = skipPiDiscoveryModelCache.get(cacheKey);
+    if (cached) {
+      return await cached;
+    }
+  }
+  const resolveUncached = async (): Promise<ResolvedModelAsyncResult> => {
+    const emptyDiscoveryStores =
+      options?.skipPiDiscovery && (!options.authStorage || !options.modelRegistry)
+        ? createEmptyPiDiscoveryStores()
+        : undefined;
+    const authStorage =
+      options?.authStorage ??
+      emptyDiscoveryStores?.authStorage ??
+      discoverAuthStorage(resolvedAgentDir);
+    const modelRegistry =
+      options?.modelRegistry ??
+      emptyDiscoveryStores?.modelRegistry ??
+      discoverModels(authStorage, resolvedAgentDir);
+    const runtimeHooks = resolveRuntimeHooks(options);
+    const explicitModel = resolveExplicitModelWithRegistry({
+      provider: normalizedRef.provider,
+      modelId: normalizedRef.model,
+      modelRegistry,
+      cfg,
+      agentDir: resolvedAgentDir,
+      runtimeHooks,
+    });
+    if (explicitModel?.kind === "suppressed") {
+      return {
+        error: buildUnknownModelError({
+          provider: normalizedRef.provider,
+          modelId: normalizedRef.model,
+          cfg,
+          agentDir: resolvedAgentDir,
+          runtimeHooks,
+        }),
+        authStorage,
+        modelRegistry,
+      };
+    }
+    const providerConfig = resolveConfiguredProviderConfig(cfg, normalizedRef.provider);
+    const resolveDynamicAttempt = async () => {
+      await runtimeHooks.prepareProviderDynamicModel({
+        provider: normalizedRef.provider,
+        config: cfg,
+        context: {
+          config: cfg,
+          agentDir: resolvedAgentDir,
+          provider: normalizedRef.provider,
+          modelId: normalizedRef.model,
+          modelRegistry,
+          providerConfig,
+        },
+      });
+      return resolveModelWithRegistry({
+        provider: normalizedRef.provider,
+        modelId: normalizedRef.model,
+        modelRegistry,
+        cfg,
+        agentDir: resolvedAgentDir,
+        runtimeHooks,
+      });
+    };
+    let model =
+      explicitModel?.kind === "resolved" &&
+      !shouldCompareProviderRuntimeResolvedModel({
+        provider: normalizedRef.provider,
+        modelId: normalizedRef.model,
+        cfg,
+        agentDir: resolvedAgentDir,
+        runtimeHooks,
+      })
+        ? explicitModel.model
+        : await resolveDynamicAttempt();
+    if (!model && !explicitModel && options?.retryTransientProviderRuntimeMiss) {
+      // Startup can race the first provider-runtime snapshot load on a fresh
+      // gateway boot. Retry once before surfacing a user-visible "Unknown model"
+      // that disappears on the next message.
+      model = await resolveDynamicAttempt();
+    }
+    if (model) {
+      return { model, authStorage, modelRegistry };
+    }
+
     return {
       error: buildUnknownModelError({
         provider: normalizedRef.provider,
@@ -1075,62 +1213,11 @@ export async function resolveModelAsync(
       authStorage,
       modelRegistry,
     };
-  }
-  const providerConfig = resolveConfiguredProviderConfig(cfg, normalizedRef.provider);
-  const resolveDynamicAttempt = async () => {
-    await runtimeHooks.prepareProviderDynamicModel({
-      provider: normalizedRef.provider,
-      config: cfg,
-      context: {
-        config: cfg,
-        agentDir: resolvedAgentDir,
-        provider: normalizedRef.provider,
-        modelId: normalizedRef.model,
-        modelRegistry,
-        providerConfig,
-      },
-    });
-    return resolveModelWithRegistry({
-      provider: normalizedRef.provider,
-      modelId: normalizedRef.model,
-      modelRegistry,
-      cfg,
-      agentDir: resolvedAgentDir,
-      runtimeHooks,
-    });
   };
-  let model =
-    explicitModel?.kind === "resolved" &&
-    !shouldCompareProviderRuntimeResolvedModel({
-      provider: normalizedRef.provider,
-      modelId: normalizedRef.model,
-      cfg,
-      agentDir: resolvedAgentDir,
-      runtimeHooks,
-    })
-      ? explicitModel.model
-      : await resolveDynamicAttempt();
-  if (!model && !explicitModel && options?.retryTransientProviderRuntimeMiss) {
-    // Startup can race the first provider-runtime snapshot load on a fresh
-    // gateway boot. Retry once before surfacing a user-visible "Unknown model"
-    // that disappears on the next message.
-    model = await resolveDynamicAttempt();
-  }
-  if (model) {
-    return { model, authStorage, modelRegistry };
-  }
-
-  return {
-    error: buildUnknownModelError({
-      provider: normalizedRef.provider,
-      modelId: normalizedRef.model,
-      cfg,
-      agentDir: resolvedAgentDir,
-      runtimeHooks,
-    }),
-    authStorage,
-    modelRegistry,
-  };
+  const resolved = resolveUncached();
+  return cacheKey
+    ? await rememberSkipPiDiscoveryModelResolution(cacheKey, resolved)
+    : await resolved;
 }
 
 /**

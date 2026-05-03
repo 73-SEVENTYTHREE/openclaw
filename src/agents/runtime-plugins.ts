@@ -1,6 +1,11 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { getCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata-snapshot.js";
-import { getActivePluginRuntimeSubagentMode } from "../plugins/runtime.js";
+import {
+  getActivePluginGatewayRuntimeRegistry,
+  getActivePluginGatewayRuntimeRegistryWorkspaceDir,
+  getActivePluginGatewayRuntimeSubagentMode,
+  getActivePluginRuntimeSubagentMode,
+} from "../plugins/runtime.js";
 import { ensureStandaloneRuntimePluginRegistryLoaded } from "../plugins/runtime/standalone-runtime-registry-loader.js";
 import { resolveUserPath } from "../utils.js";
 
@@ -27,6 +32,25 @@ function resolveStartupPluginIdsFromCurrentSnapshot(params: {
   return pluginIds.filter((pluginId): pluginId is string => typeof pluginId === "string");
 }
 
+function hasPreparedGatewayRuntime(params: {
+  workspaceDir?: string;
+  allowGatewaySubagentBinding: boolean;
+}): boolean {
+  if (!params.allowGatewaySubagentBinding) {
+    return false;
+  }
+  if (!getActivePluginGatewayRuntimeRegistry()) {
+    return false;
+  }
+  if (getActivePluginGatewayRuntimeSubagentMode() !== "gateway-bindable") {
+    return false;
+  }
+  const preparedWorkspaceDir = getActivePluginGatewayRuntimeRegistryWorkspaceDir();
+  return (
+    !params.workspaceDir || !preparedWorkspaceDir || preparedWorkspaceDir === params.workspaceDir
+  );
+}
+
 export function ensureRuntimePluginsLoaded(params: {
   config?: OpenClawConfig;
   workspaceDir?: string | null;
@@ -43,6 +67,14 @@ export function ensureRuntimePluginsLoaded(params: {
   const allowGatewaySubagentBinding =
     params.allowGatewaySubagentBinding === true ||
     getActivePluginRuntimeSubagentMode() === "gateway-bindable";
+  if (
+    hasPreparedGatewayRuntime({
+      workspaceDir,
+      allowGatewaySubagentBinding,
+    })
+  ) {
+    return;
+  }
   ensureStandaloneRuntimePluginRegistryLoaded({
     requiredPluginIds: startupPluginIds,
     loadOptions: {
