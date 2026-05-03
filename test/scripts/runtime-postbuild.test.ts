@@ -167,6 +167,33 @@ describe("runtime postbuild static assets", () => {
     );
   });
 
+  it("ignores stale compatibility shims when writing stable root runtime aliases", async () => {
+    const rootDir = createTempDir("openclaw-runtime-postbuild-");
+    const distDir = path.join(rootDir, "dist");
+    await fs.mkdir(distDir, { recursive: true });
+    await fs.writeFile(
+      path.join(distDir, "abort.runtime-New123.js"),
+      "export const abort = true;\n",
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(distDir, "abort.runtime-Old456.js"),
+      'export * from "./abort.runtime.js";\n',
+      "utf8",
+    );
+    await fs.writeFile(
+      path.join(distDir, "abort.runtime-Legacy789.js"),
+      'export * from "./abort.runtime.js";\n',
+      "utf8",
+    );
+
+    writeStableRootRuntimeAliases({ rootDir });
+
+    expect(await fs.readFile(path.join(distDir, "abort.runtime.js"), "utf8")).toBe(
+      'export * from "./abort.runtime-New123.js";\n',
+    );
+  });
+
   it("rewrites root runtime imports to stable aliases", async () => {
     const rootDir = createTempDir("openclaw-runtime-postbuild-");
     const distDir = path.join(rootDir, "dist");

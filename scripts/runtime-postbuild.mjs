@@ -48,6 +48,52 @@ const LEGACY_CLI_EXIT_COMPAT_CHUNKS = [
   },
 ];
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function isStableAliasCompatWrapper(params) {
+  let source;
+  try {
+    source = params.fs.readFileSync(params.filePath, "utf8");
+  } catch {
+    return false;
+  }
+  return new RegExp(
+    `^export \\* from ["']\\./${escapeRegExp(params.aliasFileName)}["'];\\s*$`,
+    "u",
+  ).test(source);
+}
+
+function collectRootRuntimeAliasCandidates(params) {
+  const candidatesByAlias = new Map();
+  for (const entry of params.entries.toSorted((left, right) =>
+    left.name.localeCompare(right.name),
+  )) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    const match = entry.name.match(ROOT_RUNTIME_ALIAS_PATTERN);
+    if (!match?.groups?.base) {
+      continue;
+    }
+    const aliasFileName = `${match.groups.base}.js`;
+    if (
+      isStableAliasCompatWrapper({
+        fs: params.fs,
+        filePath: path.join(params.distDir, entry.name),
+        aliasFileName,
+      })
+    ) {
+      continue;
+    }
+    const candidates = candidatesByAlias.get(aliasFileName) ?? [];
+    candidates.push(entry.name);
+    candidatesByAlias.set(aliasFileName, candidates);
+  }
+  return candidatesByAlias;
+}
+
 export function writeStableRootRuntimeAliases(params = {}) {
   const rootDir = params.rootDir ?? ROOT;
   const distDir = path.join(rootDir, "dist");
@@ -59,20 +105,7 @@ export function writeStableRootRuntimeAliases(params = {}) {
     return;
   }
 
-  const candidatesByAlias = new Map();
-  for (const entry of entries.toSorted((left, right) => left.name.localeCompare(right.name))) {
-    if (!entry.isFile()) {
-      continue;
-    }
-    const match = entry.name.match(ROOT_RUNTIME_ALIAS_PATTERN);
-    if (!match?.groups?.base) {
-      continue;
-    }
-    const aliasFileName = `${match.groups.base}.js`;
-    const candidates = candidatesByAlias.get(aliasFileName) ?? [];
-    candidates.push(entry.name);
-    candidatesByAlias.set(aliasFileName, candidates);
-  }
+  const candidatesByAlias = collectRootRuntimeAliasCandidates({ entries, distDir, fs: fsImpl });
 
   const resolveAliasCandidate = (candidates) => {
     if (candidates.length === 1) {
@@ -120,19 +153,7 @@ export function rewriteRootRuntimeImportsToStableAliases(params = {}) {
     return;
   }
 
-  const candidatesByAlias = new Map();
-  for (const entry of entries.toSorted((left, right) => left.name.localeCompare(right.name))) {
-    if (!entry.isFile()) {
-      continue;
-    }
-    const match = entry.name.match(ROOT_RUNTIME_ALIAS_PATTERN);
-    if (match?.groups?.base) {
-      const aliasFileName = `${match.groups.base}.js`;
-      const candidates = candidatesByAlias.get(aliasFileName) ?? [];
-      candidates.push(entry.name);
-      candidatesByAlias.set(aliasFileName, candidates);
-    }
-  }
+  const candidatesByAlias = collectRootRuntimeAliasCandidates({ entries, distDir, fs: fsImpl });
   const runtimeAliasFiles = new Map();
   for (const [aliasFileName, candidates] of candidatesByAlias) {
     if (candidates.length !== 1) {
