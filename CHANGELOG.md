@@ -24,7 +24,7 @@ Docs: https://docs.openclaw.ai
 
 ### Fixes
 
-- Direct APNs: route direct HTTP/2 delivery through the active managed proxy so push requests honor configured egress controls, and let `openclaw proxy validate --apns-reachable` prove APNs is reachable through the proxy before deployment. (#74905) Thanks @jesse-merhi.
+- Direct APNs: route direct HTTP/2 delivery through the active managed proxy with redacted proxy diagnostics, so push requests honor configured egress controls and `openclaw proxy validate --apns-reachable` can prove APNs is reachable through the proxy before deployment. (#74905) Thanks @jesse-merhi.
 
 - Control UI/Sessions: avoid full `sessions.list` reloads for chat-turn `sessions.changed` payloads, so large session stores no longer add multi-second delays while chat responses are being delivered. (#76676) Thanks @VACInc.
 - Doctor/Telegram: warn when selected Telegram quote replies can suppress `streaming.preview.toolProgress`, and document the `replyToMode` trade-off without changing runtime delivery. Fixes #73487. Thanks @GodsBoy.
