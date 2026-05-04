@@ -1,5 +1,6 @@
 import {
   closePluginStateSqliteStore,
+  MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN,
   MAX_PLUGIN_STATE_VALUE_BYTES,
   pluginStateClear,
   pluginStateConsume,
@@ -7,6 +8,7 @@ import {
   pluginStateEntries,
   pluginStateLookup,
   pluginStateRegister,
+  pluginStateRegisterIfAbsent,
 } from "./plugin-state-store.sqlite.js";
 import type {
   OpenKeyedStoreOptions,
@@ -41,6 +43,7 @@ const MAX_JSON_DEPTH = 64;
 type StoreOptionSignature = {
   maxEntries: number;
   defaultTtlMs?: number;
+  maxPluginEntries?: number;
 };
 
 const namespaceOptionSignatures = new Map<string, StoreOptionSignature>();
@@ -92,7 +95,8 @@ function validateMaxEntries(value: number): number {
   return value;
 }
 
-function validateOptionalTtlMs(
+function validateOptionalPositiveInteger(
+  label: string,
   value: number | undefined,
   operation: PluginStateStoreOperation = "register",
 ): number | undefined {
@@ -100,7 +104,7 @@ function validateOptionalTtlMs(
     return undefined;
   }
   if (!Number.isInteger(value) || value < 1) {
-    throw invalidInput("plugin state ttlMs must be a positive integer", operation);
+    throw invalidInput(`plugin state ${label} must be a positive integer`, operation);
   }
   return value;
 }
@@ -199,7 +203,8 @@ function assertConsistentOptions(
   }
   if (
     existing.maxEntries !== signature.maxEntries ||
-    existing.defaultTtlMs !== signature.defaultTtlMs
+    existing.defaultTtlMs !== signature.defaultTtlMs ||
+    existing.maxPluginEntries !== signature.maxPluginEntries
   ) {
     throw invalidInput(
       `plugin state namespace ${namespace} for ${pluginId} was reopened with incompatible options`,
@@ -214,8 +219,22 @@ function createKeyedStoreForPluginId<T>(
 ): PluginStateKeyedStore<T> {
   const namespace = validateNamespace(options.namespace);
   const maxEntries = validateMaxEntries(options.maxEntries);
-  const defaultTtlMs = validateOptionalTtlMs(options.defaultTtlMs);
-  assertConsistentOptions(pluginId, namespace, { maxEntries, defaultTtlMs });
+  const defaultTtlMs = validateOptionalPositiveInteger("ttlMs", options.defaultTtlMs);
+  const maxPluginEntries = validateOptionalPositiveInteger(
+    "maxPluginEntries",
+    options.maxPluginEntries,
+    "open",
+  );
+  if (maxPluginEntries != null && maxPluginEntries < maxEntries) {
+    throw invalidInput("plugin state maxPluginEntries must be >= maxEntries", "open");
+  }
+  if (maxPluginEntries != null && maxPluginEntries > MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN) {
+    throw invalidInput(
+      `plugin state maxPluginEntries must be <= ${MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN}`,
+      "open",
+    );
+  }
+  assertConsistentOptions(pluginId, namespace, { maxEntries, defaultTtlMs, maxPluginEntries });
 
   return {
     async register(key, value, opts) {
@@ -223,13 +242,32 @@ function createKeyedStoreForPluginId<T>(
       assertJsonSerializable(value);
       const json = JSON.stringify(value);
       assertValueSize(json);
-      const ttlMs = validateOptionalTtlMs(opts?.ttlMs, "register") ?? defaultTtlMs;
+      const ttlMs =
+        validateOptionalPositiveInteger("ttlMs", opts?.ttlMs, "register") ?? defaultTtlMs;
       pluginStateRegister({
         pluginId,
         namespace,
         key: normalizedKey,
         valueJson: json,
         maxEntries,
+        ...(maxPluginEntries != null ? { maxPluginEntries } : {}),
+        ...(ttlMs != null ? { ttlMs } : {}),
+      });
+    },
+    async registerIfAbsent(key, value, opts) {
+      const normalizedKey = validateKey(key, "register-if-absent");
+      assertJsonSerializable(value);
+      const json = JSON.stringify(value);
+      assertValueSize(json);
+      const ttlMs =
+        validateOptionalPositiveInteger("ttlMs", opts?.ttlMs, "register-if-absent") ?? defaultTtlMs;
+      return pluginStateRegisterIfAbsent({
+        pluginId,
+        namespace,
+        key: normalizedKey,
+        valueJson: json,
+        maxEntries,
+        ...(maxPluginEntries != null ? { maxPluginEntries } : {}),
         ...(ttlMs != null ? { ttlMs } : {}),
       });
     },

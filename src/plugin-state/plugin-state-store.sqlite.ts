@@ -19,7 +19,8 @@ const PLUGIN_STATE_SIDECAR_SUFFIXES = ["", "-shm", "-wal"] as const;
 const MAX_ENTRIES_PER_PLUGIN = 1_000;
 
 export const MAX_PLUGIN_STATE_VALUE_BYTES = 65_536;
-export const MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN = MAX_ENTRIES_PER_PLUGIN;
+export const DEFAULT_MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN = MAX_ENTRIES_PER_PLUGIN;
+export const MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN = 50_000;
 
 type PluginStateRow = {
   plugin_id: string;
@@ -369,6 +370,7 @@ export function pluginStateRegister(params: {
   key: string;
   valueJson: string;
   maxEntries: number;
+  maxPluginEntries?: number;
   ttlMs?: number;
 }): void {
   try {
@@ -399,14 +401,16 @@ export function pluginStateRegister(params: {
         );
       }
 
+      const maxPluginEntries =
+        params.maxPluginEntries ?? DEFAULT_MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN;
       const pluginCount = countRow(
         store.statements.countLivePlugin.get(params.pluginId, now) as CountRow | undefined,
       );
-      if (pluginCount > MAX_ENTRIES_PER_PLUGIN) {
+      if (pluginCount > maxPluginEntries) {
         throw createPluginStateError({
           code: "PLUGIN_STATE_LIMIT_EXCEEDED",
           operation: "register",
-          message: `Plugin state for ${params.pluginId} exceeds the ${MAX_ENTRIES_PER_PLUGIN} live row limit.`,
+          message: `Plugin state for ${params.pluginId} exceeds the ${maxPluginEntries} live row limit.`,
           path: store.path,
         });
       }
@@ -417,6 +421,78 @@ export function pluginStateRegister(params: {
       "register",
       "PLUGIN_STATE_WRITE_FAILED",
       "Failed to register plugin state entry.",
+    );
+  }
+}
+
+export function pluginStateRegisterIfAbsent(params: {
+  pluginId: string;
+  namespace: string;
+  key: string;
+  valueJson: string;
+  maxEntries: number;
+  maxPluginEntries?: number;
+  ttlMs?: number;
+}): boolean {
+  try {
+    return runWriteTransaction("register-if-absent", (store) => {
+      const now = Date.now();
+      const expiresAt = params.ttlMs == null ? null : now + params.ttlMs;
+      store.statements.pruneExpiredNamespace.run(params.pluginId, params.namespace, now);
+      const existing = store.statements.selectEntry.get(
+        params.pluginId,
+        params.namespace,
+        params.key,
+        now,
+      ) as PluginStateRow | undefined;
+      if (existing) {
+        return false;
+      }
+
+      store.statements.upsertEntry.run({
+        plugin_id: params.pluginId,
+        namespace: params.namespace,
+        entry_key: params.key,
+        value_json: params.valueJson,
+        created_at: now,
+        expires_at: expiresAt,
+      });
+
+      const namespaceCount = countRow(
+        store.statements.countLiveNamespace.get(params.pluginId, params.namespace, now) as
+          | CountRow
+          | undefined,
+      );
+      if (namespaceCount > params.maxEntries) {
+        store.statements.deleteOldestNamespace.run(
+          params.pluginId,
+          params.namespace,
+          now,
+          namespaceCount - params.maxEntries,
+        );
+      }
+
+      const maxPluginEntries =
+        params.maxPluginEntries ?? DEFAULT_MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN;
+      const pluginCount = countRow(
+        store.statements.countLivePlugin.get(params.pluginId, now) as CountRow | undefined,
+      );
+      if (pluginCount > maxPluginEntries) {
+        throw createPluginStateError({
+          code: "PLUGIN_STATE_LIMIT_EXCEEDED",
+          operation: "register-if-absent",
+          message: `Plugin state for ${params.pluginId} exceeds the ${maxPluginEntries} live row limit.`,
+          path: store.path,
+        });
+      }
+      return true;
+    });
+  } catch (error) {
+    throw wrapPluginStateError(
+      error,
+      "register-if-absent",
+      "PLUGIN_STATE_WRITE_FAILED",
+      "Failed to register plugin state entry if absent.",
     );
   }
 }

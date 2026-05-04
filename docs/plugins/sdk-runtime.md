@@ -417,12 +417,13 @@ Provider and channel execution paths must use the active runtime config snapshot
     });
 
     await store.register("key-1", { value: "hello" });
+    const claimed = await store.registerIfAbsent("key-2", { value: "pending" });
     const value = await store.lookup("key-1");
     await store.consume("key-1");
     await store.clear();
     ```
 
-    Keyed stores survive restarts and are isolated by the runtime-bound plugin id. Limits: `maxEntries` per namespace, 1,000 live rows per plugin, JSON values under 64KB, and optional TTL expiry.
+    Keyed stores survive restarts and are isolated by the runtime-bound plugin id. `registerIfAbsent` atomically inserts only when a live key is absent, which is the safe primitive for claim/check dedupe flows. Limits: `maxEntries` per namespace, 1,000 live rows per plugin by default, an optional bounded `maxPluginEntries` override for high-volume stores, JSON values under 64KB, and optional TTL expiry.
 
     <Warning>
     Bundled plugins only in this release.

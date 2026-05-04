@@ -7,6 +7,7 @@ export type PluginStateEntry<T> = {
 
 export type PluginStateKeyedStore<T> = {
   register(key: string, value: T, opts?: { ttlMs?: number }): Promise<void>;
+  registerIfAbsent(key: string, value: T, opts?: { ttlMs?: number }): Promise<boolean>;
   lookup(key: string): Promise<T | undefined>;
   consume(key: string): Promise<T | undefined>;
   delete(key: string): Promise<boolean>;
@@ -18,6 +19,7 @@ export type OpenKeyedStoreOptions = {
   namespace: string;
   maxEntries: number;
   defaultTtlMs?: number;
+  maxPluginEntries?: number;
 };
 
 export type PluginStateStoreErrorCode =
@@ -35,6 +37,7 @@ export type PluginStateStoreOperation =
   | "open"
   | "ensure-schema"
   | "register"
+  | "register-if-absent"
   | "lookup"
   | "consume"
   | "delete"
